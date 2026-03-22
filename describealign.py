@@ -8,6 +8,9 @@ __version__ = '2.0.5'
 '''
 Copyright (C) 2023  Julian Brown
 
+2026: Added functionality  Trenton Smith
+added ability to add audio description as an additional audio track instead of replacing the original
+
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -62,6 +65,7 @@ import natsort
 from collections import defaultdict
 from sortedcontainers import SortedList
 import hashlib
+import subprocess
 
 try:
   import wx
@@ -440,6 +444,10 @@ def get_ffmpeg():
 def get_ffprobe():
   return static_ffmpeg.run._get_or_fetch_platform_executables_else_raise_no_lock()[1]
 
+def get_stream_count(media_file, stream_selector):
+  probe = ffmpeg.probe(media_file, cmd=get_ffprobe(), select_streams=stream_selector)
+  return len(probe.get('streams', []))
+
 def get_key_frame_data(video_file, time=None, entry='pts_time'):
   interval = f'%+{max(60,time+40)}' if time != None else '%'
   key_frames = ffmpeg.probe(video_file, cmd=get_ffprobe(), select_streams='V', show_frames=None, 
@@ -482,26 +490,83 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
     run_async_ffmpeg_command(write_command, media_arr, f"write output file: {output_filename}")
   else:
     start_offset = video_offset - after_start_key_frame
-    media_input = ffmpeg.input(audio_desc_file, itsoffset=f'{max(0, start_offset):.6f}')
-    original_video = ffmpeg.input(video_file, an=None, ss=f'{after_start_key_frame:.6f}',
-                                  itsoffset=f'{max(0, -start_offset):.6f}', dn=None)
-    # wav files don't have codecs compatible with most video containers, so we convert to aac
-    audio_codec = 'copy' if os.path.splitext(audio_desc_file)[1] != '.wav' else 'aac'
+
+    # wav files don't have codecs compatible with most video containers, so convert the AD track to aac
+    audio_codec = 'copy' if os.path.splitext(audio_desc_file)[1].lower() != '.wav' else 'aac'
+
     # flac audio may only have experimental support in some video containers (e.g. mp4)
-    standards = 'normal' if os.path.splitext(audio_desc_file)[1] != '.flac' else 'experimental'
+    standards = 'normal' if os.path.splitext(audio_desc_file)[1].lower() != '.flac' else 'experimental'
+
     # stretch subtitle durations along with video so they don't overlap or have gaps
-    sub_stretch = f':duration=\'DURATION*{1./median_slope:.6f}\''
-    # add frag_keyframe flag to prevent some players from ignoring audio/video start offsets
-    # set both pts and dts simultaneously in video manually, as ts= does not do the same thing
-    write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                  acodec=audio_codec, vcodec='copy', scodec='copy',
-                                  max_interleave_delta='0', loglevel='error',
-                                  strict=standards, movflags='frag_keyframe',
-                                  **{'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
-                                     'bsf:s': f'setts=ts=\'{setts_cmd}\'' + sub_stretch,
-                                     "disposition:a:0": "default+visual_impaired+descriptions",
-                                     "metadata:s:a:0": "title=AD"}).overwrite_output()
-    run_ffmpeg_command(write_command, f"write output file: {output_filename}")
+    sub_stretch = f":duration='DURATION*{1./median_slope:.6f}'"
+
+    # Count original audio streams so we know which output audio index the AD track will become
+    original_audio_count = get_stream_count(video_file, 'a')
+
+    cmd = [
+      get_ffmpeg(),
+      '-y',
+
+      # Input 0: AD audio, offset to line it up
+      '-itsoffset', f'{max(0, start_offset):.6f}',
+      '-i', audio_desc_file,
+
+      # Input 1: original media, offset so video/subtitles line up
+      '-ss', f'{after_start_key_frame:.6f}',
+      '-itsoffset', f'{max(0, -start_offset):.6f}',
+      '-i', video_file,
+
+      # Map video from original media
+      '-map', '1:v:0',
+
+      # Keep all original audio tracks if they exist
+      '-map', '1:a?',
+
+      # Keep all original subtitle tracks if they exist
+      '-map', '1:s?',
+
+      # Add AD as a new audio track
+      '-map', '0:a:0',
+
+      # Copy everything by default
+      '-c:v', 'copy',
+      '-c:a', 'copy',
+      '-c:s', 'copy',
+
+      '-max_interleave_delta', '0',
+      '-movflags', 'frag_keyframe',
+
+      # Retimestamp video/subtitles to keep the alignment behavior
+      '-bsf:v', f"setts=pts='{setts_cmd}':dts='{setts_cmd}'",
+      '-bsf:s', f"setts=ts='{setts_cmd}'{sub_stretch}",
+    ]
+
+    # If the AD source format needs transcoding, transcode only the AD output stream
+    if audio_codec != 'copy':
+      cmd += [f'-c:a:{original_audio_count}', audio_codec]
+
+    if standards == 'experimental':
+      cmd += ['-strict', 'experimental']
+
+    # Label the AD stream
+    cmd += [
+      f'-disposition:a:{original_audio_count}', 'visual_impaired+descriptions',
+      f'-metadata:s:a:{original_audio_count}', 'title=Audio Description'
+    ]
+
+    # Keep first original audio default if one exists
+    if original_audio_count > 0:
+      cmd += ['-disposition:a:0', 'default']
+
+    cmd += [output_filename]
+
+    try:
+      subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+      print("  ERROR: ffmpeg failed to write output file with preserved original audio + added AD track")
+      print("FFmpeg error:")
+      print(e.stderr)
+      raise
 
 def get_static_ffmpeg_version():
   # if running from compiled binary, assume correct version of static_ffmpeg
@@ -1821,7 +1886,3 @@ def command_line_interface():
 if __name__ == "__main__":
   multiprocessing.freeze_support()
   command_line_interface()
-
-
-
-
