@@ -8,8 +8,9 @@ __version__ = '2.0.5'
 '''
 Copyright (C) 2023  Julian Brown
 
-2026: Added functionality  Trenton Smith
+03-21-2026: Added functionality  Trenton Smith
 added ability to add audio description as an additional audio track instead of replacing the original
+03-23-2026: Fixed bug that had issues when videos had subtitles. Potentially fixed issue when video was a mp4.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -137,12 +138,12 @@ def run_async_ffmpeg_command(command, media_arr, err_msg):
     if len(err) > 0:
       print("  ERROR: ffmpeg failed to " + err_msg)
       print("FFmpeg error:")
-      print(err.decode('utf-8'))
+      print(err.decode('utf-8', errors='replace'))
       raise ChildProcessError('FFmpeg error.')
   except ffmpeg.Error as e:
     print("  ERROR: ffmpeg failed to " + err_msg)
     print("FFmpeg error:")
-    print(e.stderr.decode('utf-8'))
+    print(e.stderr.decode('utf-8', errors='replace'))
     raise
 
 def get_ffmpeg_version():
@@ -480,13 +481,23 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
       #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
       # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
-      write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                    acodec='copy', vcodec='copy', scodec='copy',
-                                    max_interleave_delta='0', loglevel='error',
-                                    **{"c:a:0": "aac", "disposition:a:1": "original",
-                                       "metadata:s:a:1": "title=original",
-                                       "disposition:a:0": "default+visual_impaired+descriptions",
-                                       "metadata:s:a:0": "title=AD"}).overwrite_output()
+      write_command = ffmpeg.output(
+        media_input,
+        original_video,
+        output_filename,
+        acodec='copy',
+        vcodec='copy',
+        scodec='copy',
+        max_interleave_delta='0',
+        loglevel='error',
+        **{
+          "c:a:0": "aac",
+          "disposition:a:1": "original",
+          "metadata:s:a:1": "title=original",
+          "disposition:a:0": "default+visual_impaired+descriptions",
+          "metadata:s:a:0": "title=AD"
+        }
+      ).overwrite_output()
     run_async_ffmpeg_command(write_command, media_arr, f"write output file: {output_filename}")
   else:
     start_offset = video_offset - after_start_key_frame
@@ -500,8 +511,9 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
     # stretch subtitle durations along with video so they don't overlap or have gaps
     sub_stretch = f":duration='DURATION*{1./median_slope:.6f}'"
 
-    # Count original audio streams so we know which output audio index the AD track will become
+    # Count original streams so we know what exists and what output audio index the AD track will become
     original_audio_count = get_stream_count(video_file, 'a')
+    original_subtitle_count = get_stream_count(video_file, 's')
 
     cmd = [
       get_ffmpeg(),
@@ -521,25 +533,35 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
 
       # Keep all original audio tracks if they exist
       '-map', '1:a?',
+    ]
 
-      # Keep all original subtitle tracks if they exist
-      '-map', '1:s?',
+    # Keep all original subtitle tracks only if any exist
+    if original_subtitle_count > 0:
+      cmd += ['-map', '1:s?']
 
-      # Add AD as a new audio track
+    # Add AD as a new audio track
+    cmd += [
       '-map', '0:a:0',
 
       # Copy everything by default
       '-c:v', 'copy',
       '-c:a', 'copy',
-      '-c:s', 'copy',
+    ]
 
+    if original_subtitle_count > 0:
+      cmd += ['-c:s', 'copy']
+
+    cmd += [
       '-max_interleave_delta', '0',
       '-movflags', 'frag_keyframe',
 
-      # Retimestamp video/subtitles to keep the alignment behavior
+      # Retimestamp video to keep the alignment behavior
       '-bsf:v', f"setts=pts='{setts_cmd}':dts='{setts_cmd}'",
-      '-bsf:s', f"setts=ts='{setts_cmd}'{sub_stretch}",
     ]
+
+    # Only apply subtitle timestamp rewriting if subtitles actually exist
+    if original_subtitle_count > 0:
+      cmd += ['-bsf:s', f"setts=ts='{setts_cmd}'{sub_stretch}"]
 
     # If the AD source format needs transcoding, transcode only the AD output stream
     if audio_codec != 'copy':
@@ -556,16 +578,42 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
 
     # Keep first original audio default if one exists
     if original_audio_count > 0:
-      cmd += ['-disposition:a:0', 'default']
+      cmd += [f'-disposition:a:0', 'default']
 
     cmd += [output_filename]
 
     try:
-      subprocess.run(cmd, capture_output=True, text=True, check=True)
+      print("  ffmpeg command:")
+      print("  " + subprocess.list2cmdline(cmd))
+
+      result = subprocess.run(
+        cmd,
+        capture_output=True,
+        check=True
+      )
+
+      if result.stdout:
+        stdout_text = result.stdout.decode('utf-8', errors='replace')
+        if stdout_text.strip():
+          print("FFmpeg stdout:")
+          print(stdout_text)
+
+      if result.stderr:
+        stderr_text = result.stderr.decode('utf-8', errors='replace')
+        if stderr_text.strip():
+          print("FFmpeg stderr:")
+          print(stderr_text)
+
     except subprocess.CalledProcessError as e:
+      stdout_text = e.stdout.decode('utf-8', errors='replace') if e.stdout else ''
+      stderr_text = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
       print("  ERROR: ffmpeg failed to write output file with preserved original audio + added AD track")
-      print("FFmpeg error:")
-      print(e.stderr)
+      print("  ffmpeg command:")
+      print("  " + subprocess.list2cmdline(cmd))
+      print("FFmpeg stdout:")
+      print(stdout_text)
+      print("FFmpeg stderr:")
+      print(stderr_text)
       raise
 
 def get_static_ffmpeg_version():
@@ -1074,25 +1122,26 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
 def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitch_correction=False,
             output_dir=default_output_dir, alignment_dir=default_alignment_dir):
   video_files, has_audio_extensions = get_sorted_filenames(video, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS)
-  
+
   if yes == False and sum(has_audio_extensions) > 0:
     print("")
     print("One or more audio files found in video input. Was this intentional?")
     print("If not, press ctrl+c to kill this script.")
     input("If this was intended, press Enter to continue...")
     print("")
+
   audio_desc_files, _ = get_sorted_filenames(audio, AUDIO_EXTENSIONS)
   if len(video_files) != len(audio_desc_files):
     error_msg = ["Number of valid files in input paths are not the same.",
                  f"The video path has {len(video_files)} files",
                  f"The audio path has {len(audio_desc_files)} files"]
     raise RuntimeError("\n".join(error_msg))
-  
+
   print("")
   ensure_folders_exist([output_dir])
   if PLOT_ALIGNMENT_TO_FILE:
     ensure_folders_exist([alignment_dir])
-  
+
   print("")
   for (video_file, audio_desc_file) in zip(video_files, audio_desc_files):
     print(os.path.split(video_file)[1])
@@ -1103,7 +1152,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     print("If not, press ctrl+c to kill this script.")
     input("If they are correct, press Enter to continue...")
     print("")
-  
+
   # if ffmpeg isn't installed, install it
   if not is_ffmpeg_installed():
     if get_static_ffmpeg_version() < 3:
@@ -1112,8 +1161,122 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     print("Downloading and installing ffmpeg (media editor, 50 MB download)...")
     get_ffmpeg()
     if not is_ffmpeg_installed():
-      RuntimeError("Failed to install ffmpeg.")
+      raise RuntimeError("Failed to install ffmpeg.")
     print("Successfully installed ffmpeg.")
+
+  print("Processing files:")
+
+  failures = []
+
+  for (video_file, audio_desc_file, has_audio_extension) in zip(video_files, audio_desc_files,
+                                                                has_audio_extensions):
+    try:
+      # Output filename (and extension) is the same as input, except the prepend and directory
+      output_filename = prepend + os.path.split(video_file)[1]
+      output_filename = os.path.join(output_dir, output_filename)
+      print(f" {output_filename}")
+
+      if (not stretch_audio) and has_audio_extension:
+        raise RuntimeError("Argument --stretch_audio is required when both inputs are audio files.")
+
+      if os.path.exists(output_filename) and os.path.getsize(output_filename) > 1e5:
+        print("   output file already exists, skipping...")
+        continue
+
+      # print warning if output file's full path is longer than Windows MAX_PATH (260)
+      full_output_filename = os.path.abspath(output_filename)
+      if IS_RUNNING_WINDOWS and len(full_output_filename) >= 260:
+        print("  WARNING: very long output path, ffmpeg may fail...")
+
+      num_channels = 2 if stretch_audio else 1
+      print("  reading video file...\r", end='')
+      video_arr = parse_audio_from_file(video_file, num_channels)
+
+      print("  computing video features... \r", end='')
+      video_energy = get_energy(video_arr)
+      video_zero_crossings = get_zero_crossings(video_arr)
+      video_freq_bands = get_freq_bands(video_arr)
+      video_features = [video_energy, video_zero_crossings] + video_freq_bands
+
+      if not stretch_audio:
+        del video_arr
+
+      print("  reading audio file...       \r", end='')
+      audio_desc_arr = parse_audio_from_file(audio_desc_file, num_channels)
+
+      print("  computing audio features...\r", end='')
+      audio_desc_energy = get_energy(audio_desc_arr)
+      audio_desc_zero_crossings = get_zero_crossings(audio_desc_arr)
+      audio_desc_freq_bands = get_freq_bands(audio_desc_arr)
+      audio_desc_features = [audio_desc_energy, audio_desc_zero_crossings] + audio_desc_freq_bands
+
+      if not stretch_audio:
+        del audio_desc_arr
+
+      outputs = align(video_features, audio_desc_features, video_energy, audio_desc_energy)
+      audio_desc_times, video_times, similarity_percent, path, median_slope = outputs
+
+      del video_energy, video_zero_crossings, video_freq_bands, video_features
+      del audio_desc_energy, audio_desc_zero_crossings, audio_desc_freq_bands, audio_desc_features
+
+      if similarity_percent < 20:
+        print(f"  WARNING: similarity {similarity_percent:.1f}%, likely mismatched files")
+      if similarity_percent > 90:
+        print(f"  WARNING: similarity {similarity_percent:.1f}%, likely undescribed media")
+
+      if stretch_audio:
+        # lower memory usage version of np.std for large arrays
+        def low_ram_std(arr):
+          avg = np.mean(arr, dtype=np.float64)
+          return np.sqrt(np.einsum('ij,ij->i', arr, arr, dtype=np.float64)/np.prod(arr.shape) - (avg**2))
+
+        # rescale RMS intensity of audio to match video
+        audio_desc_arr *= (low_ram_std(video_arr) / low_ram_std(audio_desc_arr))[:, None]
+
+        replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
+        del audio_desc_arr
+
+        # prevent peaking by rescaling to within +/- 32,766
+        video_arr *= (2**15 - 2.) / np.max(np.abs(video_arr))
+
+        print("  processing output file...                   \r", end='')
+        write_replaced_media_to_disk(output_filename, video_arr, None if has_audio_extension else video_file,
+                                     median_slope=median_slope)
+        del video_arr
+      else:
+        video_offset = video_times[0] - audio_desc_times[0]
+        # to make ffmpeg cut at the last keyframe before the audio starts, use a timestamp after it
+        after_start_key_frame = get_closest_key_frame_time(video_file, video_offset)
+        print("  processing output file...                   \r", end='')
+        setts_cmd = encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset)
+        write_replaced_media_to_disk(output_filename, None, video_file, audio_desc_file,
+                                     setts_cmd, video_offset, after_start_key_frame,
+                                     median_slope=median_slope)
+
+      if PLOT_ALIGNMENT_TO_FILE:
+        plot_filename_no_ext = os.path.join(alignment_dir, os.path.splitext(os.path.split(video_file)[1])[0])
+        plot_alignment(plot_filename_no_ext, path, audio_desc_times, video_times, similarity_percent,
+                       median_slope, stretch_audio, no_pitch_correction)
+
+    except Exception as e:
+      failures.append((video_file, audio_desc_file, str(e)))
+      print("")
+      print("  ERROR: failed processing pair")
+      print(f"    video: {video_file}")
+      print(f"    audio: {audio_desc_file}")
+      traceback.print_exc()
+      print("")
+
+  if failures:
+    print("")
+    print("Completed with failures:")
+    for video_file, audio_desc_file, err in failures:
+      print(f"  video: {video_file}")
+      print(f"  audio: {audio_desc_file}")
+      print(f"  error: {err}")
+      print("")
+  else:
+    print("All files processed.       ")
   
   print("Processing files:")
   
