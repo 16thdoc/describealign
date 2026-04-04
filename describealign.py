@@ -1,4 +1,4 @@
-__version__ = '2.0.6'
+__version__ = '2.0.6.t.1'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -7,6 +7,16 @@ __version__ = '2.0.6'
 
 '''
 Copyright (C) 2023  Julian Brown
+
+
+Fork: 16thdoc
+
+03-21-2026: Added functionality
+added ability to add audio description as an additional audio track instead of replacing the original
+
+03-23-2026: Fixed bug that had issues when videos had subtitles. Potentially fixed issue when video was a mp4.
+
+04-02-2026: updated to version 2.0.6 then modified changes
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -62,6 +72,7 @@ import natsort
 from collections import defaultdict
 from sortedcontainers import SortedList
 import hashlib
+import subprocess
 
 try:
   import wx
@@ -126,7 +137,7 @@ def run_ffmpeg_command(command, err_msg):
   except ffmpeg.Error as e:
     print("  ERROR: ffmpeg failed to " + err_msg)
     print("FFmpeg error:")
-    print(e.stderr.decode('utf-8'))
+    print(e.stderr.decode('utf-8', errors='replace'))
     raise
 
 def run_async_ffmpeg_command(command, media_arr, err_msg):
@@ -136,13 +147,21 @@ def run_async_ffmpeg_command(command, media_arr, err_msg):
     if len(err) > 0:
       print("  ERROR: ffmpeg failed to " + err_msg)
       print("FFmpeg error:")
-      print(err.decode('utf-8'))
+      print(err.decode('utf-8', errors='replace'))
       raise ChildProcessError('FFmpeg error.')
   except ffmpeg.Error as e:
     print("  ERROR: ffmpeg failed to " + err_msg)
     print("FFmpeg error:")
-    print(e.stderr.decode('utf-8'))
+    print(e.stderr.decode('utf-8', errors='replace'))
     raise
+
+def get_ffmpeg_version():
+  ffmpeg_command = ffmpeg.input('').output('', version='')
+  stdout, _ = run_ffmpeg_command(ffmpeg_command, "get version information")
+  # strip out leading letter n indicating nightly build (e.g. static_ffmpeg's linux build)
+  version_string = str(stdout).split('version ')[1].lstrip('n')
+  version_major = float(version_string[:2])
+  return version_major
 
 # read audio from file with ffmpeg and convert to numpy array
 def parse_audio_from_file(media_file, num_channels=2):
@@ -435,6 +454,10 @@ def get_ffmpeg():
 def get_ffprobe():
   return static_ffmpeg.run._get_or_fetch_platform_executables_else_raise_no_lock()[1]
 
+def get_stream_count(media_file, stream_selector):
+  probe = ffmpeg.probe(media_file, cmd=get_ffprobe(), select_streams=stream_selector)
+  return len(probe.get('streams', []))
+
 def get_key_frame_data(video_file, time=None, entry='pts_time'):
   interval = f'%+{max(60,time+40)}' if time != None else '%'
   key_frames = ffmpeg.probe(video_file, cmd=get_ffprobe(), select_streams='V', show_frames=None, 
@@ -467,36 +490,140 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
       #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
       # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
-      write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                    acodec='copy', vcodec='copy', scodec='copy',
-                                    max_interleave_delta='0', loglevel='error',
-                                    **{"c:a:0": "aac", "disposition:a:1": "original",
-                                       "metadata:s:a:1": "title=original",
-                                       "disposition:a:0": "default+visual_impaired+descriptions",
-                                       "metadata:s:a:0": "title=AD"}).overwrite_output()
+      write_command = ffmpeg.output(
+        media_input,
+        original_video,
+        output_filename,
+        acodec='copy',
+        vcodec='copy',
+        scodec='copy',
+        max_interleave_delta='0',
+        loglevel='error',
+        **{
+          "c:a:0": "aac",
+          "disposition:a:1": "original",
+          "metadata:s:a:1": "title=original",
+          "disposition:a:0": "default+visual_impaired+descriptions",
+          "metadata:s:a:0": "title=AD"
+        }
+      ).overwrite_output()
     run_async_ffmpeg_command(write_command, media_arr, f"write output file: {output_filename}")
   else:
     start_offset = video_offset - after_start_key_frame
-    media_input = ffmpeg.input(audio_desc_file, itsoffset=f'{max(0, start_offset):.6f}')
-    original_video = ffmpeg.input(video_file, an=None, ss=f'{after_start_key_frame:.6f}',
-                                  itsoffset=f'{max(0, -start_offset):.6f}', dn=None)
-    # wav files don't have codecs compatible with most video containers, so we convert to aac
-    audio_codec = 'copy' if os.path.splitext(audio_desc_file)[1] != '.wav' else 'aac'
+
+    # wav files don't have codecs compatible with most video containers, so convert the AD track to aac
+    audio_codec = 'copy' if os.path.splitext(audio_desc_file)[1].lower() != '.wav' else 'aac'
+
     # flac audio may only have experimental support in some video containers (e.g. mp4)
-    standards = 'normal' if os.path.splitext(audio_desc_file)[1] != '.flac' else 'experimental'
+    standards = 'normal' if os.path.splitext(audio_desc_file)[1].lower() != '.flac' else 'experimental'
+
     # stretch subtitle durations along with video so they don't overlap or have gaps
-    sub_stretch = f':duration=\'DURATION*{1./median_slope:.6f}\''
-    # add frag_keyframe flag to prevent some players from ignoring audio/video start offsets
-    # set both pts and dts simultaneously in video manually, as ts= does not do the same thing
-    write_command = ffmpeg.output(media_input, original_video, output_filename,
-                                  acodec=audio_codec, vcodec='copy', scodec='copy',
-                                  max_interleave_delta='0', loglevel='error',
-                                  strict=standards, movflags='frag_keyframe',
-                                  **{'bsf:v': f'setts=pts=\'{setts_cmd}\':dts=\'{setts_cmd}\'',
-                                     'bsf:s': f'setts=ts=\'{setts_cmd}\'' + sub_stretch,
-                                     "disposition:a:0": "default+visual_impaired+descriptions",
-                                     "metadata:s:a:0": "title=AD"}).overwrite_output()
-    run_ffmpeg_command(write_command, f"write output file: {output_filename}")
+    sub_stretch = f":duration='DURATION*{1./median_slope:.6f}'"
+
+    # Count original streams so we know what exists and what output audio index the AD track will become
+    original_audio_count = get_stream_count(video_file, 'a')
+    original_subtitle_count = get_stream_count(video_file, 's')
+
+    cmd = [
+      get_ffmpeg(),
+      '-y',
+
+      # Input 0: AD audio, offset to line it up
+      '-itsoffset', f'{max(0, start_offset):.6f}',
+      '-i', audio_desc_file,
+
+      # Input 1: original media, offset so video/subtitles line up
+      '-ss', f'{after_start_key_frame:.6f}',
+      '-itsoffset', f'{max(0, -start_offset):.6f}',
+      '-i', video_file,
+
+      # Map video from original media
+      '-map', '1:v:0',
+
+      # Keep all original audio tracks if they exist
+      '-map', '1:a?',
+    ]
+
+    # Keep all original subtitle tracks only if any exist
+    if original_subtitle_count > 0:
+      cmd += ['-map', '1:s?']
+
+    # Add AD as a new audio track
+    cmd += [
+      '-map', '0:a:0',
+
+      # Copy everything by default
+      '-c:v', 'copy',
+      '-c:a', 'copy',
+    ]
+
+    if original_subtitle_count > 0:
+      cmd += ['-c:s', 'copy']
+
+    cmd += [
+      '-max_interleave_delta', '0',
+      '-movflags', 'frag_keyframe',
+
+      # Retimestamp video to keep the alignment behavior
+      '-bsf:v', f"setts=pts='{setts_cmd}':dts='{setts_cmd}'",
+    ]
+
+    # Only apply subtitle timestamp rewriting if subtitles actually exist
+    if original_subtitle_count > 0:
+      cmd += ['-bsf:s', f"setts=ts='{setts_cmd}'{sub_stretch}"]
+
+    # If the AD source format needs transcoding, transcode only the AD output stream
+    if audio_codec != 'copy':
+      cmd += [f'-c:a:{original_audio_count}', audio_codec]
+
+    if standards == 'experimental':
+      cmd += ['-strict', 'experimental']
+
+    # Label the AD stream
+    cmd += [
+      f'-disposition:a:{original_audio_count}', 'visual_impaired+descriptions',
+      f'-metadata:s:a:{original_audio_count}', 'title=Audio Description'
+    ]
+
+    # Keep first original audio default if one exists
+    if original_audio_count > 0:
+      cmd += [f'-disposition:a:0', 'default']
+
+    cmd += [output_filename]
+
+    try:
+      print("  ffmpeg command:")
+      print("  " + subprocess.list2cmdline(cmd))
+
+      result = subprocess.run(
+        cmd,
+        capture_output=True,
+        check=True
+      )
+
+      if result.stdout:
+        stdout_text = result.stdout.decode('utf-8', errors='replace')
+        if stdout_text.strip():
+          print("FFmpeg stdout:")
+          print(stdout_text)
+
+      if result.stderr:
+        stderr_text = result.stderr.decode('utf-8', errors='replace')
+        if stderr_text.strip():
+          print("FFmpeg stderr:")
+          print(stderr_text)
+
+    except subprocess.CalledProcessError as e:
+      stdout_text = e.stdout.decode('utf-8', errors='replace') if e.stdout else ''
+      stderr_text = e.stderr.decode('utf-8', errors='replace') if e.stderr else ''
+      print("  ERROR: ffmpeg failed to write output file with preserved original audio + added AD track")
+      print("  ffmpeg command:")
+      print("  " + subprocess.list2cmdline(cmd))
+      print("FFmpeg stdout:")
+      print(stdout_text)
+      print("FFmpeg stderr:")
+      print(stderr_text)
+      raise
 
 def get_static_ffmpeg_version():
   # if running from compiled binary, assume correct version of static_ffmpeg
@@ -512,13 +639,7 @@ def is_ffmpeg_installed():
   indicator_file = os.path.join(ffmpeg_dir, "installed.crumb")
   if not os.path.exists(indicator_file):
     return False
-  with open(indicator_file, 'r') as f:
-    install_info = f.readline()
-  # example installed.crumb contents:
-  # installed from https://github.com/zackees/ffmpeg_bins/raw/main/v5.0/win32.zip on 2024-01-01 01:09:01.553876
-  # installed from https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/win32.zip on 2026-02-04 05:07:51.293058
-  version = float(install_info.split('ffmpeg_bins/raw/main/v')[1].split('/')[0])
-  if version < 6:
+  if get_ffmpeg_version() < 6:
     print("Old ffmpeg version detected, updating to newer version...")
     os.remove(indicator_file)
     return False

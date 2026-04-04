@@ -1,27 +1,35 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "describealign"
-authors = [{ name = "Julian Brown", email = "julbean@proton.me" }]
-description = "Combines videos with matching audio files (e.g. audio descriptions)"
+version = "2.0.6"
+description = "DescribeAlign CLI"
 readme = "README.md"
-requires-python = ">=3.8"
-classifiers = [
-  "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
-  "Operating System :: OS Independent",
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-only" }
+authors = [
+    { name = "Julian Brown" },
+    { name = "Trenton Smith" }
 ]
-dynamic = ["version", "dependencies"]
+dependencies = [
+    "numpy",
+    "ffmpeg-python",
+    "platformdirs",
+    "static-ffmpeg",
+    "scipy",
+    "natsort",
+    "sortedcontainers"
+]
 
-[tool.setuptools.dynamic]
-version = { file = "version" }
-dependencies = { file = "requirements.txt" }
+[project.optional-dependencies]
+gui = [
+    "wxPython"
+]
 
 [project.scripts]
 describealign = "describealign:command_line_interface"
 
-[project.urls]
-"Homepage" = "https://github.com/julbean/describealign"
-"Bug Tracker" = "https://github.com/julbean/describealign/issues"
+[tool.setuptools]
+py-modules = ["describealign"]
