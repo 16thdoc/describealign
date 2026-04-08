@@ -44,7 +44,16 @@ jobs:
 
       - name: Set build vars
         id: build-vars
-        run: echo "version=$(cat version)" >> "$GITHUB_OUTPUT"
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import re
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          match = re.search(r'^version = "([^"]+)"', text, re.MULTILINE)
+          if not match:
+              raise SystemExit("Could not find version in pyproject.toml")
+          print(f"version={match.group(1)}")
+          PY
 
       - name: Build Executable
         run: |

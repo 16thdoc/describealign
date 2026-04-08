@@ -9,7 +9,7 @@ __version__ = '2.0.6.t.1'
 Copyright (C) 2023  Julian Brown
 
 
-Fork: 16thdoc
+Fork: 16thdoc / Trenton Smith
 
 03-21-2026: Added functionality
 added ability to add audio description as an additional audio track instead of replacing the original
@@ -1948,7 +1948,5 @@ def command_line_interface():
 if __name__ == "__main__":
   multiprocessing.freeze_support()
   command_line_interface()
-
-
 
 

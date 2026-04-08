@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "describealign"
-version = "2.0.6"
-description = "DescribeAlign CLI"
+version = "2.0.6+t.1"
+description = "DescribeAlign fork maintained by Trenton Smith"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "GPL-3.0-only" }
