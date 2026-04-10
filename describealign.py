@@ -1,4 +1,4 @@
-__version__ = '2.0.6.t.1'
+__version__ = '2.0.6+t.1.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -1948,5 +1948,4 @@ def command_line_interface():
 if __name__ == "__main__":
   multiprocessing.freeze_support()
   command_line_interface()
-
 

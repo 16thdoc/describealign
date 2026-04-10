@@ -179,7 +179,7 @@ With default settings (i.e. --stretch_audio set to False), describealign doesn't
 
 ## Fork Changelog Notes
 
-- `2.0.6.t.1`: Trenton fork identifier added, README and packaging metadata cleaned up, and the project is being prepared for heavier fork-specific behavior
+- `2.0.6+t.1.0`: Trenton fork identifier added, packaging now uses a single canonical Python version string, and the project is being prepared for heavier fork-specific behavior
 
 
 
