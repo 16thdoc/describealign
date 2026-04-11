@@ -798,8 +798,6 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
     path.append(backpointers[path[-1][:2]])
   path.pop()
   path.reverse()
-  if len(path) < max(min(len(video_energy), len(audio_desc_energy)) / 500., 5 * 210):
-    raise RuntimeError("Alignment failed, are the input files mismatched?")
   y, x = np.array(path).T
   
   half_hann_window = hann_window[:samples_per_node-1] / np.sum(hann_window[:samples_per_node-1])
@@ -1948,4 +1946,3 @@ def command_line_interface():
 if __name__ == "__main__":
   multiprocessing.freeze_support()
   command_line_interface()
-
