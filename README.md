@@ -21,6 +21,19 @@ This fork is being shaped around a practical AD media workflow rather than a pur
 
 That means this fork may prefer bluntly useful quality-of-life changes over strict upstream parity.
 
+### Current Pipeline Assumptions
+
+This fork is commonly driven by Trenton's PowerShell wrapper layer rather than by hand-entered one-off commands. In that environment:
+
+- media often arrives in staged `_work` folders after a shell-side matcher resolves exact titles, seasons, and AD companions
+- AD audio may come from extracted ZIP contents or direct MP3 companions staged from Plex `New Content`
+- batch ordering still matters: when directories are passed, `describealign` pairs files lexicographically
+- the wrapper expects outputs in `videos_with_ad` and plots/text artifacts in `alignment_plots`
+
+Operational caveat:
+
+- successful alignment still needs enough free local disk space for the generated output media, even if the original source file was staged from NAS/Plex storage
+
 ## Roadmap
 
 - Keep hardening multi-file AD workflows that hit real Plex and NAS storage
