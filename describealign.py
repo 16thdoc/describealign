@@ -695,6 +695,12 @@ def get_freq_bands(arr):
     arr = band_bottom
   return freq_bands
 
+def describe_match_array(label, arr):
+  arr = np.asarray(arr)
+  if arr.size == 0:
+    return f"{label}=0"
+  return f"{label}={arr.size} [{arr[0]}..{arr[-1]}]"
+
 def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   samples_per_node = 210 // TIMESTEPS_PER_SECOND
   hann_window_unnormed = scipy.signal.windows.hann(2*samples_per_node+1)[1:-1]
@@ -797,8 +803,17 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
       raise RuntimeError("Infinite Loop Encountered!")
     path.append(backpointers[path[-1][:2]])
   path.pop()
+  if len(path) == 0:
+    video_windows = max(0, len(video_energy) - len(hann_window))
+    audio_windows = max(0, len(audio_desc_energy) - len(hann_window))
+    raise RuntimeError(
+      "Alignment failed: no candidate match path was found. "
+      f"Search windows video={video_windows}, audio={audio_windows}. "
+      "This usually means the inputs are mismatched or have too little overlapping audio to align."
+    )
   path.reverse()
   y, x = np.array(path).T
+  print(f"  candidate path: {describe_match_array('audio nodes', x)}, {describe_match_array('video nodes', y)}")
   
   half_hann_window = hann_window[:samples_per_node-1] / np.sum(hann_window[:samples_per_node-1])
   half_samples_per_node = samples_per_node // 2
@@ -829,6 +844,16 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   errs = (continuity_err < 3)
   x = x[errs]
   y = y[errs]
+  print(
+    "  refining match: pass 1 of 2... "
+    f"kept {np.count_nonzero(errs)}/{len(errs)} nodes "
+    f"({describe_match_array('audio', x)}, {describe_match_array('video', y)})"
+  )
+  if len(x) == 0 or len(y) == 0:
+    raise RuntimeError(
+      "Alignment failed after refinement pass 1: no usable match nodes remained. "
+      "The inputs may be mismatched, too quiet, or missing enough shared audio structure to align."
+    )
   
   audio_desc_features_scaled = []
   video_features_scaled = []
@@ -856,6 +881,12 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
   
   x = compressed_x
   y = compressed_y
+  print(f"  compressed path: {describe_match_array('audio', x)}, {describe_match_array('video', y)}")
+  if len(x) == 0 or len(y) == 0:
+    raise RuntimeError(
+      "Alignment failed after path compression: no usable match nodes remained. "
+      "The inputs may be mismatched or produced too few stable anchor points."
+    )
   
   match_dict = defaultdict(list)
   x_unique = [-1]
@@ -865,6 +896,12 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
       x_unique.append(audio_desc_index)
   x = np.array(x_unique[1:])
   y = np.array([np.mean(match_dict[audio_desc_index]) for audio_desc_index in x])
+  print(f"  unique anchors: {describe_match_array('audio', x)}, {describe_match_array('video', y)}")
+  if len(x) < 2 or len(y) < 2:
+    raise RuntimeError(
+      "Alignment failed: not enough anchor points remained after deduplication. "
+      f"Need at least 2, got audio={len(x)} video={len(y)}."
+    )
   
   # L1-Minimization to solve the alignment problem using a linear program
   # the absolute value functions needed for "absolute error" can be represented
