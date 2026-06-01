@@ -1,4 +1,4 @@
-__version__ = '2.0.6+t.1.0'
+__version__ = '2.0.7+t.1.0'
 
 # combines videos with matching audio files (e.g. audio descriptions)
 # input: video or folder of videos and an audio file or folder of audio files
@@ -223,8 +223,9 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
   with open(plot_filename_no_ext + '.txt', 'w') as file:
     parameters = {'stretch_audio':stretch_audio, 'no_pitch_correction':no_pitch_correction}
     print(f"Parameters: {parameters}", file=file)
+    print(f"Version: {__version__}", file=file)
     this_script_path = os.path.abspath(__file__)
-    print(f"Version Hash: {get_version_hash(this_script_path)}", file=file)
+    print(f"Script Hash: {get_version_hash(this_script_path)}", file=file)
     video_offset = video_times[0] - audio_times[0]
     print(f"Input file similarity: {similarity_percent:.2f}%", file=file)
     print("Main changes needed to video to align it to audio input:", file=file)
@@ -475,6 +476,13 @@ def get_closest_key_frame_time(video_file, time):
   next_key_frame = np.min(next_key_frame_times) if len(next_key_frame_times) > 0 else time
   return (prev_key_frame + next_key_frame) / 2.
 
+def is_first_video_track_ad(video_file):
+  streams = ffmpeg.probe(video_file, cmd=get_ffprobe(), select_streams='a').get('streams', [])
+  if len(streams) == 0:
+    return False
+  disposition = streams[0].get('disposition', {})
+  return disposition.get('descriptions', 0) or disposition.get('visual_impaired', 0)
+
 # outputs a new media file with the replaced audio (which includes audio descriptions)
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
                                  setts_cmd=None, video_offset=None, after_start_key_frame=None,
@@ -487,6 +495,18 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       write_command = ffmpeg.output(media_input, output_filename, loglevel='error').overwrite_output()
     else:
       original_video = ffmpeg.input(video_file, dn=None)
+      kwargs = {
+        "c:a:0": "aac",
+        "disposition:a:0": "default+visual_impaired+descriptions",
+        "metadata:s:a:0": "title=AD",
+        "disposition:a:1": "visual_impaired+descriptions"
+      }
+      # If the first existing track is not already AD, mark it as original.
+      if not is_first_video_track_ad(video_file):
+        kwargs.update({
+          "disposition:a:1": "original",
+          "metadata:s:a:1": "title=original"
+        })
       # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
       #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
       # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
@@ -499,13 +519,7 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
         scodec='copy',
         max_interleave_delta='0',
         loglevel='error',
-        **{
-          "c:a:0": "aac",
-          "disposition:a:1": "original",
-          "metadata:s:a:1": "title=original",
-          "disposition:a:0": "default+visual_impaired+descriptions",
-          "metadata:s:a:0": "title=AD"
-        }
+        **kwargs
       ).overwrite_output()
     run_async_ffmpeg_command(write_command, media_arr, f"write output file: {output_filename}")
   else:
@@ -1209,7 +1223,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       raise RuntimeError("Failed to install ffmpeg.")
     print("Successfully installed ffmpeg.")
   
-  print("Processing files:")
+  print(f"Processing files with v{__version__}:")
   
   for (video_file, audio_desc_file, has_audio_extension) in zip(video_files, audio_desc_files,
                                                            has_audio_extensions):
@@ -1276,7 +1290,13 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         return np.sqrt(np.einsum('ij,ij->i', arr, arr, dtype=np.float64)/np.prod(arr.shape) - (avg**2))
       
       # rescale RMS intensity of audio to match video
-      audio_desc_arr *= (low_ram_std(video_arr) / low_ram_std(audio_desc_arr))[:, None]
+      scale_factor = low_ram_std(video_arr) / low_ram_std(audio_desc_arr)
+      # avoid float16 overflow by only scaling down the louder audio
+      for channel_index, channel_scale_factor in enumerate(scale_factor):
+        if channel_scale_factor > 1:
+          video_arr[channel_index] /= channel_scale_factor
+        else:
+          audio_desc_arr[channel_index] *= channel_scale_factor
       
       replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
       del audio_desc_arr
