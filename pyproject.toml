@@ -16,8 +16,11 @@ classifiers = [
 dynamic = ["version", "dependencies"]
 
 [tool.setuptools.dynamic]
-version = { file = "version" }
+version = { attr = "describealign.__version__" }
 dependencies = { file = "requirements.txt" }
+
+[tool.setuptools]
+py-modules = ["describealign"]
 
 [project.scripts]
 describealign = "describealign:command_line_interface"
