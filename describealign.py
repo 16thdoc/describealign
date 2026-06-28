@@ -38,6 +38,7 @@ MAX_RATE_RATIO_DIFF_ALIGN = .1
 MIN_DURATION_TO_REPLACE_SECONDS = 2
 JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO = .005
 MIN_STRETCH_OFFSET = 30
+ORIGINAL_AUDIO_RETIMESTAMP_THRESHOLD_SECONDS = .001
 
 if PLOT_ALIGNMENT_TO_FILE:
   import matplotlib.pyplot as plt
@@ -439,6 +440,20 @@ def encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset):
   setts_cmd = ''.join(setts_cmd)
   return setts_cmd
 
+def get_max_alignment_timeline_adjustment(audio_desc_times, video_times):
+  if len(audio_desc_times) < 2 or len(video_times) < 2:
+    return 0.
+  timeline_adjustments = [0.]
+  total_adjustment = 0.
+  for audio_desc_diff, video_diff in zip(np.diff(audio_desc_times), np.diff(video_times)):
+    total_adjustment += audio_desc_diff - video_diff
+    timeline_adjustments.append(total_adjustment)
+  return float(np.max(np.abs(timeline_adjustments)))
+
+def should_retimestamp_original_audio(audio_desc_times, video_times):
+  max_adjustment = get_max_alignment_timeline_adjustment(audio_desc_times, video_times)
+  return max_adjustment > ORIGINAL_AUDIO_RETIMESTAMP_THRESHOLD_SECONDS, max_adjustment
+
 def get_ffmpeg():
   return static_ffmpeg.run._get_or_fetch_platform_executables_else_raise_no_lock()[0]
 
@@ -473,7 +488,7 @@ def is_first_video_track_ad(video_file):
 # outputs a new media file with the replaced audio (which includes audio descriptions)
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
                                  setts_cmd=None, video_offset=None, after_start_key_frame=None,
-                                 median_slope=1.):
+                                 median_slope=1., retimestamp_original_audio=False):
   # if a media array is given, stretch_audio is enabled and media_arr should be added to the video
   if media_arr is not None:
     media_input = ffmpeg.input('pipe:', format='s16le', acodec='pcm_s16le', ac=2, ar=AUDIO_SAMPLE_RATE)
@@ -563,6 +578,12 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       # Retimestamp video to keep the alignment behavior
       '-bsf:v', f"setts=pts='{setts_cmd}':dts='{setts_cmd}'",
     ]
+
+    # If the video timeline is adjusted, retimestamp copied original audio the same way.
+    # The added AD track is already the timeline target, so leave that stream alone.
+    if retimestamp_original_audio:
+      for audio_index in range(original_audio_count):
+        cmd += [f'-bsf:a:{audio_index}', f"setts=pts='{setts_cmd}':dts='{setts_cmd}'"]
 
     # Only apply subtitle timestamp rewriting if subtitles actually exist
     if original_subtitle_count > 0:
@@ -1283,9 +1304,17 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         after_start_key_frame = get_closest_key_frame_time(video_file, video_offset)
         print("  processing output file...                   \r", end='')
         setts_cmd = encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset)
+        retimestamp_original_audio, max_original_audio_adjustment = should_retimestamp_original_audio(
+          audio_desc_times, video_times)
+        if retimestamp_original_audio:
+          print(f"  retimestamping original audio to match adjusted video timeline " + \
+                f"(max {max_original_audio_adjustment:.3f}s)             ")
+        else:
+          print("  original audio stream copy is safe; no retimestamp needed        ")
         ffmpeg_command = write_replaced_media_to_disk(output_filename, None, video_file, audio_desc_file,
-                                                      setts_cmd, video_offset, after_start_key_frame,
-                                                      median_slope=median_slope)
+                                                       setts_cmd, video_offset, after_start_key_frame,
+                                                       median_slope=median_slope,
+                                                       retimestamp_original_audio=retimestamp_original_audio)
 
       if PLOT_ALIGNMENT_TO_FILE:
         plot_filename_no_ext = os.path.join(alignment_dir, os.path.splitext(os.path.split(video_file)[1])[0])
