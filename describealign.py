@@ -39,6 +39,7 @@ MIN_DURATION_TO_REPLACE_SECONDS = 2
 JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO = .005
 MIN_STRETCH_OFFSET = 30
 ORIGINAL_AUDIO_RETIMESTAMP_THRESHOLD_SECONDS = .001
+PREFERRED_AUDIO_LANGUAGE = 'eng'
 
 if PLOT_ALIGNMENT_TO_FILE:
   import matplotlib.pyplot as plt
@@ -150,12 +151,22 @@ def run_async_ffmpeg_command(command, media_arr, err_msg):
     print(e.stderr.decode('utf-8', errors='replace'))
     raise
 
+# return the preferred audio stream's ordinal among the audio streams, falling back to the first
+def get_preferred_audio_stream_index(media_file):
+  streams = ffmpeg.probe(media_file, cmd=get_ffprobe(), select_streams='a').get('streams', [])
+  for index, stream in enumerate(streams):
+    if stream.get('tags', {}).get('language', '').lower() == PREFERRED_AUDIO_LANGUAGE:
+      return index
+  return 0
+
 # read audio from file with ffmpeg and convert to numpy array
-def parse_audio_from_file(media_file, num_channels=2):
-  # retrieve only the first audio track, injecting silence/trimming to force timestamps to match up
+def parse_audio_from_file(media_file, num_channels=2, preferred_language=False):
+  # retrieve the selected audio track, injecting silence/trimming to force timestamps to match up
   # for example, when the video starts before the audio this fills that starting gap with silence
+  audio_stream_index = get_preferred_audio_stream_index(media_file) if preferred_language else 0
   ffmpeg_command = ffmpeg.input(media_file).output('-', format='s16le', acodec='pcm_s16le',
-                                                   af='aresample=async=1:first_pts=0', map='0:a:0',
+                                                   af='aresample=async=1:first_pts=0',
+                                                   map=f'0:a:{audio_stream_index}',
                                                    ac=num_channels, ar=AUDIO_SAMPLE_RATE, loglevel='error')
   media_stream, _ = run_ffmpeg_command(ffmpeg_command, f"parse audio from input file: {media_file}")
   media_arr = np.frombuffer(media_stream, np.int16).astype(np.float16).reshape((-1, num_channels)).T
@@ -1235,7 +1246,7 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
 
       num_channels = 2 if stretch_audio else 1
       print("  reading video file...\r", end='')
-      video_arr = parse_audio_from_file(video_file, num_channels)
+      video_arr = parse_audio_from_file(video_file, num_channels, preferred_language=True)
 
       print("  computing video features... \r", end='')
       video_energy = get_energy(video_arr)

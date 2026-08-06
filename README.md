@@ -13,6 +13,7 @@ It compares the source video's audio against the external audio, figures out whe
 - Exports combined media into `videos_with_ad`.
 - Writes alignment plots and text reports into `alignment_plots`.
 - Supports single files, batch folders, drag-and-drop, and CLI usage.
+- Uses an English source-audio track when one is present in a multilingual video, otherwise falls back to its first audio track.
 - Can also align audio-to-audio when `--stretch_audio` is used.
 
 This fork also includes a practical quality-of-life change:
