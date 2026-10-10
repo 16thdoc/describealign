@@ -69,6 +69,7 @@ from collections import defaultdict
 from sortedcontainers import SortedList
 import hashlib
 import subprocess
+import tempfile
 
 try:
   import wx
@@ -90,6 +91,36 @@ if IS_RUNNING_WINDOWS:
 else:
   default_output_dir = os.path.expanduser('~') + '/videos_with_ad'
   default_alignment_dir = os.path.expanduser('~') + '/alignment_plots'
+
+def run_ffmpeg_with_filter_files(cmd):
+  # CreateProcess limits the entire command line to 32,767 UTF-16 code units.
+  # Repeated setts expressions can exceed it even with short media paths.
+  def command_length(args):
+    return len(subprocess.list2cmdline(args).encode('utf-16-le')) // 2
+
+  if not IS_RUNNING_WINDOWS or command_length(cmd) < 30000:
+    return subprocess.run(cmd, capture_output=True, check=True)
+
+  # FFmpeg 7+ supports -/option to load an option value from a UTF-8 file.
+  # Keep the original cmd intact for the replayable alignment report.
+  with tempfile.TemporaryDirectory(prefix='describealign-bsf-') as temp_dir:
+    launch_cmd = list(cmd)
+    filter_files = {}
+    for index, option in enumerate(cmd[:-1]):
+      if option == '-bsf' or option.startswith('-bsf:'):
+        expression = cmd[index + 1]
+        if expression not in filter_files:
+          filename = os.path.join(temp_dir, f'filter-{len(filter_files)}.txt')
+          with open(filename, 'w', encoding='utf-8', newline='') as f:
+            f.write(expression)
+          filter_files[expression] = filename
+        launch_cmd[index] = '-/' + option[1:]
+        launch_cmd[index + 1] = filter_files[expression]
+
+    if command_length(launch_cmd) >= 30000:
+      raise RuntimeError('FFmpeg command is still too long for Windows after externalizing filters.')
+    print('  loading timestamp filters from temporary files (requires FFmpeg 7+)')
+    return subprocess.run(launch_cmd, capture_output=True, check=True)
 
 def ensure_folders_exist(dirs):
   for dir in dirs:
@@ -627,11 +658,7 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       print("  ffmpeg command:")
       print("  " + subprocess.list2cmdline(cmd))
 
-      result = subprocess.run(
-        cmd,
-        capture_output=True,
-        check=True
-      )
+      result = run_ffmpeg_with_filter_files(cmd)
 
       if result.stdout:
         stdout_text = result.stdout.decode('utf-8', errors='replace')
@@ -1187,6 +1214,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
     print("")
 
   audio_desc_files, _ = get_sorted_filenames(audio, AUDIO_EXTENSIONS)
+  if not video_files or not audio_desc_files:
+    raise RuntimeError('No valid video/audio input pairs found.')
   if len(video_files) != len(audio_desc_files):
     error_msg = ["Number of valid files in input paths are not the same.",
                  f"The video path has {len(video_files)} files",
@@ -1349,8 +1378,10 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       print(f"  audio: {audio_desc_file}")
       print(f"  error: {err}")
       print("")
+    return 1
   else:
     print("All files processed.       ")
+    return 0
 
 if wx is not None:
   def write_config_file(config_path, settings):
@@ -1546,10 +1577,11 @@ if wx is not None:
     writer = QueueWriter(print_queue)
     with redirect_stdout(writer), redirect_stderr(writer):
       try:
-        combine(*args, **kwargs)
+        sys.exit(combine(*args, **kwargs))
       except Exception:
         print("  ERROR: exception raised")
         traceback.print_exc()
+        sys.exit(1)
 
   class FrameCombine(wx.Frame):
     def __init__(self, parent, config_path, video_files, audio_files, is_dark):
@@ -2021,8 +2053,8 @@ def command_line_interface():
     os.chmod(get_ffmpeg(), 0o755)
     os.chmod(get_ffprobe(), 0o755)
   elif args.video and args.audio:
-    combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend, 
-            args.no_pitch_correction, args.output_dir, args.alignment_dir)
+    return combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend,
+                   args.no_pitch_correction, args.output_dir, args.alignment_dir)
   else:
     parser.print_usage()
 
@@ -2030,4 +2062,4 @@ def command_line_interface():
 # python3 describealign.py video.mp4 audio_desc.mp3
 if __name__ == "__main__":
   multiprocessing.freeze_support()
-  command_line_interface()
+  sys.exit(command_line_interface())

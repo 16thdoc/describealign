@@ -139,6 +139,18 @@ The text report includes things like:
 
 So if the result looks cursed, you have something better than vibes to debug with.
 
+On Windows, large timestamp corrections are loaded from temporary bitstream-filter
+files instead of exceeding the process command-line limit. This fallback requires
+FFmpeg 7 or newer (the current bundled static FFmpeg satisfies this). It preserves
+the same video/original-audio/subtitle corrections; the added AD track is unchanged.
+Filter files are removed after FFmpeg exits, including on launch or mux failure.
+Alignment reports retain the inline command, not expired temporary paths.
+
+The CLI exits with status `1` if any input pair fails, after attempting the remaining
+pairs, and `0` when all pairs succeed. Python callers receive the same status from
+`combine()`. Missing/empty or mismatched inputs raise an error rather than reporting
+a successful empty batch.
+
 ## Advanced Usage
 
 ### Batch Processing
@@ -176,6 +188,11 @@ da.combine("video.mp4", "audio_description.mp3")
 ```
 
 ## Test Media
+
+Run the regression tests with `python -m unittest discover -s tests -v`.
+These include a real FFmpeg mux with an oversized Windows command, multiple original
+audio tracks, subtitles, and an additional AD track; generated media stays in a
+temporary directory, not your media library.
 
 The repo includes sample media under `test_media` so you can verify that your install is working without sacrificing one of your real files to the debugging gods.
 
