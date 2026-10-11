@@ -120,6 +120,55 @@ class ExitStatusTests(unittest.TestCase):
 
 
 class RealMuxTests(unittest.TestCase):
+  def test_stretched_ad_is_appended_and_original_streams_are_preserved(self):
+    import numpy as np
+    ffmpeg = da.get_ffmpeg()
+    for audio_count in (0, 2):
+      with self.subTest(original_audio_tracks=audio_count), tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source = str(root / 'source.mkv')
+        output = str(root / 'stretched.mkv')
+        subtitles = root / 'captions.srt'
+        subtitles.write_text('1\n00:00:00,100 --> 00:00:00,900\nCaption\n', encoding='utf-8')
+        command = [ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                   'testsrc2=size=64x64:rate=10:duration=2']
+        if audio_count:
+          command += ['-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+                      '-f', 'lavfi', '-i', 'sine=frequency=880:duration=2']
+        command += ['-i', str(subtitles), '-map', '0:v']
+        if audio_count:
+          command += ['-map', '1:a', '-map', '2:a',
+                      '-metadata:s:a:0', 'language=eng', '-metadata:s:a:0', 'title=English',
+                      '-metadata:s:a:1', 'language=ita', '-metadata:s:a:1', 'title=Italian']
+        command += ['-map', f'{audio_count + 1}:s', '-c:v', 'mpeg4', '-c:a', 'aac', '-c:s', 'srt', source]
+        subprocess.run(command, check=True)
+        pcm = np.zeros((da.AUDIO_SAMPLE_RATE * 2, 2), dtype=np.int16)
+        da.write_replaced_media_to_disk(output, pcm, video_file=source)
+        probe = da.ffmpeg.probe(output, cmd=da.get_ffprobe())
+        audio = [s for s in probe['streams'] if s['codec_type'] == 'audio']
+        self.assertEqual(len(audio), audio_count + 1)
+        self.assertEqual(audio[-1]['tags']['title'], 'Audio Description')
+        self.assertEqual(audio[-1]['disposition']['visual_impaired'], 1)
+        # Matroska stores visual_impaired; FFmpeg may not round-trip the separate
+        # descriptions disposition bit in this container.
+        self.assertAlmostEqual(float(probe['format']['duration']), 2, delta=0.1)
+        if audio_count:
+          self.assertEqual([s['tags']['title'] for s in audio[:-1]], ['English', 'Italian'])
+          self.assertEqual([s['tags']['language'] for s in audio[:-1]], ['eng', 'ita'])
+          self.assertTrue(all(s['disposition']['visual_impaired'] == 0 for s in audio[:-1]))
+        def hashes(path, maps):
+          result = subprocess.run([ffmpeg, '-v', 'error', '-i', path, *maps,
+                                   '-c', 'copy', '-f', 'streamhash', '-hash', 'sha256', '-'],
+                                  capture_output=True, text=True, check=True)
+          return result.stdout.splitlines()
+        source_maps = ['-map', '0:v', '-map', '0:s']
+        if audio_count:
+          source_maps += ['-map', '0:a']
+        output_maps = ['-map', '0:v', '-map', '0:s']
+        for index in range(audio_count):
+          output_maps += ['-map', f'0:a:{index}']
+        self.assertEqual(hashes(source, source_maps), hashes(output, output_maps))
+
   def test_oversized_mux_preserves_original_audio_subtitles_and_ad(self):
     ffmpeg = da.get_ffmpeg()
     with tempfile.TemporaryDirectory(prefix='describealign-test-') as temp_dir:

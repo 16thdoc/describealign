@@ -539,15 +539,23 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
       write_command = ffmpeg.output(media_input, output_filename, loglevel='error').overwrite_output()
     else:
       original_video = ffmpeg.input(video_file, dn=None)
-      kwargs = {"c:a:0": "aac", "disposition:a:0": "default+visual_impaired+descriptions",
-                "metadata:s:a:0": "title=AD", "disposition:a:1": "visual_impaired+descriptions"}
-      # if the first track isn't also AD (e.g. output by a previous run), rename it to "original"
-      if not is_first_video_track_ad(video_file):
-        kwargs.update({"disposition:a:1": "original", "metadata:s:a:1": "title=original"})
+      # Match non-stretch output: preserve original streams first, append AD.
+      # AD-first output made downstream last-track labeling mark an original
+      # language track as AD, and the old a:1 override also mislabeled originals.
+      original_audio_count = get_stream_count(video_file, 'a')
+      ad_disposition = 'visual_impaired+descriptions'
+      if original_audio_count == 0:
+        ad_disposition = 'default+' + ad_disposition
+      kwargs = {f"c:a:{original_audio_count}": "aac",
+                f"disposition:a:{original_audio_count}": ad_disposition,
+                f"metadata:s:a:{original_audio_count}": "title=Audio Description",
+                "map_metadata": 0, "map_chapters": 0}
+      if original_audio_count > 0:
+        kwargs["disposition:a:0"] = "default"
       # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
       #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
       # more info about the bug and fix: https://reddit.com/r/ffmpeg/comments/efddfs/
-      write_command = ffmpeg.output(media_input, original_video, output_filename,
+      write_command = ffmpeg.output(original_video, media_input, output_filename,
                                     acodec='copy', vcodec='copy', scodec='copy',
                                     max_interleave_delta='0', loglevel='error',
                                     **kwargs).overwrite_output()

@@ -19,6 +19,7 @@ It compares the source video's audio against the external audio, figures out whe
 This fork also includes a practical quality-of-life change:
 
 - It can preserve the original video audio and add the audio description as an additional audio track instead of always replacing the original.
+- Both normal and `--stretch_audio` video output preserve the original streams first and append one `Audio Description` track. Stretch mode encodes only the synthesized/stretched AD audio; copied original audio retains its language/title metadata and is not marked as description. A video with no original audio is supported too.
 
 That makes it much nicer for real-world media workflows where you want both the source audio and the AD track available instead of flattening everything into one irreversible blob.
 
