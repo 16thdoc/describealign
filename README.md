@@ -1,6 +1,6 @@
 # describealign
 
-`describealign` is a desktop-friendly Python tool for lining up a video with a matching audio file, usually an audio description track, and exporting a synced result without making you hand-edit timestamps like a cave goblin.
+`describealign` is a desktop-friendly Python tool with an accessible GUI for lining up a video with a matching audio file, usually an audio description track, and exporting a synced result without making you hand-edit timestamps like a cave goblin.
 
 It compares the source video's audio against the external audio, figures out where they line up, then builds a usable output file and alignment report. The usual use case is taking a movie or episode plus a separate audio description track and producing a version that is actually watchable instead of spiritually hostile.
 
@@ -136,7 +136,7 @@ The text report includes things like:
 - similarity score
 - start offset
 - rate-change segments
-- version hash used to generate the alignment
+- version and script hash used to generate the alignment
 
 So if the result looks cursed, you have something better than vibes to debug with.
 

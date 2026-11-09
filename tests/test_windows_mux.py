@@ -119,6 +119,21 @@ class ExitStatusTests(unittest.TestCase):
         self.assertIn('Completed with failures:', result.stdout)
 
 
+class AlignmentReportTests(unittest.TestCase):
+  def test_utf8_report_preserves_unicode_paths_and_filter_quotes(self):
+    import numpy as np
+    times = np.linspace(0, 2, 41)
+    path = np.column_stack((times, times + 0.2, np.zeros_like(times),
+                            np.ones_like(times), times))
+    command = 'ffmpeg -i "L\'été 字幕.mkv" -bsf:v "setts=pts=\'PTS+1/TB\'" output.mkv'
+    with tempfile.TemporaryDirectory() as temp_dir:
+      report = Path(temp_dir, 'alignment')
+      da.plot_alignment(str(report), path, np.array([0.2, 2.2]), np.array([0., 2.]),
+                        50., 1., False, False, command)
+      self.assertIn(command, report.with_suffix('.txt').read_text(encoding='utf-8'))
+      self.assertGreater(report.with_suffix('.png').stat().st_size, 0)
+
+
 class RealMuxTests(unittest.TestCase):
   def test_stretched_ad_is_appended_and_original_streams_are_preserved(self):
     import numpy as np
@@ -126,8 +141,8 @@ class RealMuxTests(unittest.TestCase):
     for audio_count in (0, 2):
       with self.subTest(original_audio_tracks=audio_count), tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
-        source = str(root / 'source.mkv')
-        output = str(root / 'stretched.mkv')
+        source = str(root / "director's source.mkv")
+        output = str(root / "director's stretched.mkv")
         subtitles = root / 'captions.srt'
         subtitles.write_text('1\n00:00:00,100 --> 00:00:00,900\nCaption\n', encoding='utf-8')
         command = [ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i',
@@ -143,7 +158,9 @@ class RealMuxTests(unittest.TestCase):
         command += ['-map', f'{audio_count + 1}:s', '-c:v', 'mpeg4', '-c:a', 'aac', '-c:s', 'srt', source]
         subprocess.run(command, check=True)
         pcm = np.zeros((da.AUDIO_SAMPLE_RATE * 2, 2), dtype=np.int16)
-        da.write_replaced_media_to_disk(output, pcm, video_file=source)
+        report = da.write_replaced_media_to_disk(output, pcm, video_file=source)
+        self.assertIn(source.replace('\\', '/'), report)
+        self.assertIn(output.replace('\\', '/'), report)
         probe = da.ffmpeg.probe(output, cmd=da.get_ffprobe())
         audio = [s for s in probe['streams'] if s['codec_type'] == 'audio']
         self.assertEqual(len(audio), audio_count + 1)
@@ -173,9 +190,9 @@ class RealMuxTests(unittest.TestCase):
     ffmpeg = da.get_ffmpeg()
     with tempfile.TemporaryDirectory(prefix='describealign-test-') as temp_dir:
       root = Path(temp_dir)
-      source = str(root / 'original.mkv')
-      ad = str(root / 'AD.wav')
-      output = str(root / 'output.mkv')
+      source = str(root / "director's original.mkv")
+      ad = str(root / "AD's track.wav")
+      output = str(root / "director's output.mkv")
       subtitles = root / 'captions.srt'
       subtitles.write_text('1\n00:00:00,100 --> 00:00:00,900\nFixture caption\n', encoding='utf-8')
       subprocess.run([ffmpeg, '-v', 'error', '-y', '-f', 'lavfi', '-i',
@@ -198,6 +215,9 @@ class RealMuxTests(unittest.TestCase):
                                                 0, 0, retimestamp_original_audio=True)
       self.assertGreater(len(report), 32767)
       self.assertNotIn('describealign-bsf-', report)
+      for filename in (source, ad, output):
+        self.assertIn(filename.replace('\\', '/'), report)
+      self.assertIn("setts=pts='", report)
       probe = da.ffmpeg.probe(output, cmd=da.get_ffprobe())
       streams = probe['streams']
       self.assertEqual(sum(s['codec_type'] == 'video' for s in streams), 1)
