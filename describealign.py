@@ -205,6 +205,33 @@ def parse_audio_from_file(media_file, num_channels=2, preferred_language=False):
   media_arr = np.frombuffer(media_stream, np.int16).astype(np.float16).reshape((-1, num_channels)).T
   return media_arr
 
+
+def match_audio_levels(video_arr, audio_desc_arr):
+  def channel_std(arr):
+    # Accumulate per channel without allocating a centered copy of the soundtrack.
+    mean = np.mean(arr, axis=1, dtype=np.float64)
+    mean_square = np.einsum('ij,ij->i', arr, arr, dtype=np.float64) / arr.shape[1]
+    return np.sqrt(np.maximum(mean_square - mean**2, 0))
+
+  for channel, (video_std, ad_std) in enumerate(zip(channel_std(video_arr), channel_std(audio_desc_arr))):
+    if not (np.isfinite(video_std) and np.isfinite(ad_std) and video_std > 0 and ad_std > 0):
+      continue
+    if video_std > ad_std:
+      louder, gain = video_arr[channel], ad_std / video_std
+    else:
+      louder, gain = audio_desc_arr[channel], video_std / ad_std
+    np.multiply(louder, gain, out=louder, dtype=np.float32)
+
+
+def normalize_audio_peak(pcm):
+  peak = max(abs(float(pcm.min())), abs(float(pcm.max())))
+  if not np.isfinite(peak):
+    raise RuntimeError("Aligned audio contains non-finite samples.")
+  if peak:
+    # float16 rounds 32766 up to 32768, which wraps when converted to signed PCM.
+    pcm_limit = float(np.nextafter(np.float16(32768), np.float16(0)))
+    np.multiply(pcm, pcm_limit / peak, out=pcm, dtype=np.float32)
+
 def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similarity_percent,
                    median_slope, stretch_audio, no_pitch_correction, ffmpeg_command):
   downsample = 20
@@ -617,7 +644,7 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
         output_start = 0 if is_first_iter else 1
         is_last_iter = (input.shape[1] <= (max_cached_chunks + 2) * 1.1 * window_size)
         output_end = None if is_last_iter else max_cached_chunks
-        input_end = None if is_last_iter else (cut + window_size)
+        input_end = None if is_last_iter else (cut + 2 * window_size)
         yield from itertools.islice(get_pearson_corrs_generator(input[:,:input_end], negative, jumps),
                                     output_start, output_end)
         if is_last_iter:
@@ -665,6 +692,8 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       else:
         jumps = range(MIN_STRETCH_OFFSET, window_size)
     num_windows = (num_input_samples // window_size)
+    if num_windows < 3:
+      raise RuntimeError("Pitch-preserving stretch needs at least three input windows.")
     window_to_offset = lambda window_index: (total_offset_samples * \
                                              min((num_windows - 1), max(0, window_index))) // (num_windows - 1)
     # note the absolute value in the drift
@@ -677,7 +706,6 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     best_jump_locations = np.zeros((num_windows, len(jumps)), dtype=np.int16)
     cum_loss = np.zeros((3, drift_window_size)) + np.inf
     cum_loss[1:, max_drift] = 0
-    last_offset_diff = 0
     # if the output needs to be longer than the input, we need to jump backwards in the input
     pearson_corrs_generator = get_pearson_corrs_generator(input, (total_offset_samples > 0), jumps)
     for window_index in range(num_windows):
@@ -685,43 +713,49 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       # for each jump distance, determine the best input index in the window to make that jump
       best_jump_locations[window_index] = np.argmax(corrs, axis=0)
       best_jump_losses = 1 - corrs[best_jump_locations[window_index], np.arange(corrs.shape[1])]
+      best_jump_losses[~np.isfinite(best_jump_losses)] = np.inf
       offset_diff = window_to_offset_diff(window_index)
-      offset_diff2 = offset_diff + last_offset_diff
+      offset_diff2 = offset_diff + window_to_offset_diff(window_index - 1)
       offset_jump_losses = np.zeros((len(jumps)+1, drift_window_size)) + np.inf
       # consider not jumping at all, copying the loss from the corresponding offset one window back
-      offset_jump_slice = slice(None, offset_jump_losses.shape[1] - offset_diff)
-      offset_jump_losses[0,offset_jump_slice] = cum_loss[(window_index-1)%3,offset_diff:]
+      if offset_diff < drift_window_size:
+        offset_jump_losses[0,:drift_window_size-offset_diff] = cum_loss[(window_index-1)%3,offset_diff:]
       for jump_index, jump in enumerate(jumps):
-        truncation_amount = offset_diff2 - jump
-        offset_jump_slice = slice(jump, drift_window_size - max(0, truncation_amount))
-        cum_loss_slice = slice(offset_diff2, drift_window_size + min(0, truncation_amount))
+        shift = offset_diff2 - jump
+        start = max(0, -shift)
+        stop = min(drift_window_size, drift_window_size - shift)
+        if not np.isfinite(best_jump_losses[jump_index]) or start >= stop:
+          continue
         # consider jumping the given distance from two windows back
         # a window is skipped when jumping to prevent overlapping crossfades
-        offset_jump_losses[jump_index+1, offset_jump_slice] = cum_loss[(window_index-2)%3, cum_loss_slice] + \
-                                                              best_jump_losses[jump_index]
+        offset_jump_losses[jump_index+1,start:stop] = (
+          cum_loss[(window_index-2)%3,start+shift:stop+shift] + best_jump_losses[jump_index])
       best_jumps = np.argmin(offset_jump_losses, axis=0)
       backpointers[window_index] = best_jumps
       cum_loss[window_index%3] = offset_jump_losses[best_jumps, np.arange(offset_jump_losses.shape[1])]
-      last_offset_diff = offset_diff
+    if not np.isfinite(cum_loss[(num_windows-1)%3,max_drift]):
+      raise RuntimeError("No finite pitch-preserving stretch path reaches the required sample count.")
+
     drift = max_drift
     best_jumps = []
-    skip_window = False
-    for window_index in range(num_windows - 1, -1, -1):
-      drift += window_to_offset_diff(window_index + 1)
-      if skip_window:
-        skip_window = False
-        continue
+    window_index = num_windows - 1
+    while window_index >= 0:
+      if not 0 <= drift < drift_window_size:
+        raise RuntimeError("Pitch-preserving stretch path left the supported offset range.")
       best_jump_index = backpointers[window_index, drift] - 1
+      drift += window_to_offset_diff(window_index)
       if best_jump_index == -1:
+        window_index -= 1
         continue
       best_jump = jumps[best_jump_index]
       jump_input_index = window_index * window_size + \
                          best_jump_locations[window_index, best_jump_index].item()
-      drift -= best_jump
-      skip_window = True
+      drift += window_to_offset_diff(window_index - 1) - best_jump
       best_jumps.append((jump_input_index, best_jump))
-    best_jumps = best_jumps[::-1]
-    best_jumps = np.array(best_jumps)
+      window_index -= 2
+    if drift != max_drift:
+      raise RuntimeError("Pitch-preserving stretch path did not reach its initial offset.")
+    best_jumps = np.array(best_jumps[::-1], dtype=int).reshape(-1, 2)
     # reintroduce the sign of the jump distances
     # if the output is longer, use backwards jumps in the input to duplicate samples
     # if the output is shorter, use forwards jumps in the input to remove samples
@@ -735,14 +769,19 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
     chunk_lengths = input_ends - input_starts
     output_ends = np.cumsum(chunk_lengths)
     output_starts = np.concatenate(([0], output_ends[:-1]))
-    bump = scipy.signal.windows.hann(2 * window_size + 1)
-    bump_head = bump[:window_size]
-    bump_tail = bump[window_size:-1]
-    output[:,:window_size] = input[:,:window_size]
-    for in_start, in_end, out_start, out_end in zip(input_starts, input_ends, output_starts, output_ends):
-      output[:,out_start:out_start+window_size] *= bump_tail
-      output[:,out_start:out_start+window_size] += input[:,in_start:in_start+window_size] * bump_head
-      output[:,out_start+window_size:out_end+window_size] = input[:,in_start+window_size:in_end+window_size]
+    if (np.any(input_starts < 0) or np.any(input_ends > num_input_samples)
+        or np.any(chunk_lengths < 0) or output_ends[-1] != num_output_samples):
+      raise RuntimeError("Pitch-preserving stretch path contains a splice outside the samples to render.")
+    for index, (in_start, in_end, out_start, out_end) in enumerate(
+        zip(input_starts, input_ends, output_starts, output_ends)):
+      output[:,out_start:out_end] = input[:,in_start:in_end]
+      if index:
+        previous_end = input_ends[index-1]
+        overlap = min(window_size, in_end-in_start, num_input_samples-previous_end)
+        if overlap:
+          fade = scipy.signal.windows.hann(2*overlap + 1)[:overlap].astype(np.float32)
+          output[:,out_start:out_start+overlap] = (
+            input[:,previous_end:previous_end+overlap] * (1-fade) + input[:,in_start:in_start+overlap] * fade)
   
   if spans is None:
     spans = get_replacement_spans(audio_desc_times, video_times)
@@ -1666,27 +1705,14 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
             reasons.append('pitch_correction_disabled')
           references = get_sync_windows(metrics, video_arr) if spans else None
 
-        # lower memory usage version of np.std for large arrays
-        def low_ram_std(arr):
-          avg = np.mean(arr, dtype=np.float64)
-          return np.sqrt(np.einsum('ij,ij->i', arr, arr, dtype=np.float64)/np.prod(arr.shape) - (avg**2))
-
-        # rescale RMS intensity of audio to match video
-        scale_factor = low_ram_std(video_arr) / low_ram_std(audio_desc_arr)
-        # avoid overflow by only scaling down the louder audio
-        for channel_index, channel_scale_factor in enumerate(scale_factor):
-          if channel_scale_factor > 1:
-            video_arr[channel_index] /= channel_scale_factor
-          else:
-            audio_desc_arr[channel_index] *= channel_scale_factor
+        match_audio_levels(video_arr, audio_desc_arr)
 
         replace_aligned_segments(
           video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction, spans=spans,
           join_fade_samples=round(PRESERVATION_JOIN_FADE_SECONDS*AUDIO_SAMPLE_RATE) if validation_manifest else 0)
         del audio_desc_arr
 
-        # prevent peaking by rescaling to within +/- 32,766
-        video_arr *= (2**15 - 2.) / np.max(np.abs(video_arr))
+        normalize_audio_peak(video_arr)
 
         print("  processing output file...                   \r", end='')
         ffmpeg_command = write_replaced_media_to_disk(output_filename, video_arr,

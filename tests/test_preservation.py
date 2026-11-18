@@ -58,6 +58,52 @@ class PreservationPlanTests(unittest.TestCase):
     self.assertIn('unverified_ad_trim', self.plan([0., 16.], [0., 16.])[-1])
 
 
+class PitchPreservingAudioTests(unittest.TestCase):
+  def test_silent_channel_with_dc_offset_does_not_corrupt_stretch(self):
+    rate = da.AUDIO_SAMPLE_RATE
+    sample_count = 2*rate
+    extended_count = sample_count + 930
+    time = np.arange(sample_count) / rate
+    tone = np.sin(2*np.pi*311*time)
+    ad = np.array([10000 + 9000*tone, np.zeros_like(tone)], dtype=np.float16)
+    output = np.repeat(np.array([[8000.], [3000.]], dtype=np.float16), extended_count, axis=1)
+    with np.errstate(invalid='raise', divide='raise'), contextlib.redirect_stdout(io.StringIO()):
+      da.match_audio_levels(output, ad)
+      self.assertTrue(np.isfinite(ad).all())
+      da.replace_aligned_segments(output, ad, None, None, False,
+                                  spans=[(0, sample_count, 0, extended_count)])
+      da.normalize_audio_peak(output)
+    self.assertTrue(np.isfinite(output).all())
+    np.testing.assert_array_equal(output[1], np.zeros(extended_count))
+    self.assertEqual(float(output.max()), 32752.)
+    self.assertGreater(output.astype(np.int16).max(), 0)
+    frequencies = np.fft.rfftfreq(extended_count, 1/rate)
+    spectrum = np.abs(np.fft.rfft(output[0] - output[0].mean(dtype=np.float32)))
+    self.assertAlmostEqual(frequencies[1+spectrum[1:].argmax()], 311., delta=2.)
+
+  def test_level_matching_uses_independent_channel_statistics(self):
+    movie = np.array([[12000., 12016., 11984.], [1200., 1400., 1000.]], dtype=np.float16)
+    ad = np.array([[8000., 8032., 7968.], [600., 650., 550.]], dtype=np.float16)
+    da.match_audio_levels(movie, ad)
+    np.testing.assert_array_equal(ad[0], [4000., 4016., 3984.])
+    np.testing.assert_array_equal(movie[1], [300., 350., 250.])
+    silence = np.zeros((2, 4), dtype=np.float16)
+    with np.errstate(invalid='raise', divide='raise'):
+      da.normalize_audio_peak(silence)
+    self.assertFalse(silence.any())
+
+  def test_invalid_stretch_path_does_not_modify_audio(self):
+    sample_count = 2*da.AUDIO_SAMPLE_RATE
+    extended_count = sample_count + 930
+    ad = np.full((2, sample_count), np.nan, dtype=np.float16)
+    output = np.full((2, extended_count), 123., dtype=np.float16)
+    with self.assertRaisesRegex(RuntimeError, 'No finite pitch-preserving stretch path'), \
+         contextlib.redirect_stdout(io.StringIO()):
+      da.replace_aligned_segments(output, ad, None, None, False,
+                                  spans=[(0, sample_count, 0, extended_count)])
+    np.testing.assert_array_equal(output, 123.)
+
+
 class PreservationMuxTests(unittest.TestCase):
   def test_render_checks_synced_movie_audio_and_restored_tail(self):
     rate = da.AUDIO_SAMPLE_RATE
