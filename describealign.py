@@ -40,12 +40,14 @@ JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO = .005
 MIN_STRETCH_OFFSET = 30
 ORIGINAL_AUDIO_RETIMESTAMP_THRESHOLD_SECONDS = .001
 PREFERRED_AUDIO_LANGUAGE = 'eng'
+PRESERVATION_JOIN_FADE_SECONDS = .045
 
 if PLOT_ALIGNMENT_TO_FILE:
   import matplotlib.pyplot as plt
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 import os
 import glob
 import itertools
@@ -274,8 +276,316 @@ def plot_alignment(plot_filename_no_ext, path, audio_times, video_times, similar
       print("FFmpeg command:", file=file)
       print(ffmpeg_command, file=file)
 
+def get_replacement_spans(audio_desc_times, video_times):
+  ad_samples = (audio_desc_times * AUDIO_SAMPLE_RATE).astype(int)
+  video_samples = (video_times * AUDIO_SAMPLE_RATE).astype(int)
+  spans = []
+  for ad_start, ad_end, video_start, video_end in zip(
+      ad_samples[:-1], ad_samples[1:], video_samples[:-1], video_samples[1:]):
+    video_length = video_end - video_start
+    if video_length < MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE:
+      continue
+    if abs(1 - (ad_end - ad_start) / video_length) <= MAX_RATE_RATIO_DIFF_ALIGN:
+      spans.append((ad_start, ad_end, video_start, video_end))
+  return spans
+
+
+def plan_preserved_audio(audio_times, video_times, path, similarity, rate, video_samples, ad_samples,
+                         movie_seconds):
+  """Assess the overlap and report the spans that will actually replace original sound."""
+  sample_rate = AUDIO_SAMPLE_RATE
+  ad_seconds = ad_samples / sample_rate
+  soundtrack_seconds = video_samples / sample_rate
+  spans = []
+  for ad_start, ad_end, video_start, video_end in get_replacement_spans(audio_times, video_times):
+    if not (0 <= ad_start < ad_end <= ad_samples and 0 <= video_start < video_end <= video_samples):
+      continue
+    # Allow timestamp quantization around a true offset-only fit without warping its audio.
+    if abs((ad_end - ad_start) - (video_end - video_start)) <= round(.020 * sample_rate):
+      copy_length = min(ad_end - ad_start, video_end - video_start)
+      ad_end, video_end = ad_start + copy_length, video_start + copy_length
+    spans.append((ad_start, ad_end, video_start, video_end))
+
+  # Only count non-silent, positive local support for the fitted map.
+  fitted_video = np.interp(path[:,1], audio_times, video_times, left=np.nan, right=np.nan)
+  reliable = path[(path[:,2] >= 0) & (path[:,3] > .3) &
+                  (np.abs(path[:,0] - fitted_video) <= .120)]
+  first_video = spans[0][2] / sample_rate if spans else 0.
+  last_video = spans[-1][3] / sample_rate if spans else 0.
+  reliable = reliable[(reliable[:,0] >= first_video) & (reliable[:,0] <= last_video)]
+  support = np.sort(reliable[:,0])
+  first_ad = spans[0][0] / sample_rate if spans else 0.
+  last_ad = spans[-1][1] / sample_rate if spans else 0.
+  max_interior = max(((right[2] - left[3]) / sample_rate
+                      for left, right in zip(spans, spans[1:])), default=0.)
+  local_discontinuity = np.abs(np.diff(video_times) - rate * np.diff(audio_times))
+  max_discontinuity = float(np.max(local_discontinuity)) if len(local_discontinuity) else 0.
+  offset_range = float(np.ptp(video_times - rate*audio_times))
+  max_unsupported = float(np.max(np.diff(np.r_[first_video, support, last_video])))
+  window_edges = np.linspace(first_video, last_video, 1 + max(4, int((last_video-first_video)/15)))
+  window_counts, _ = np.histogram(support, bins=window_edges)
+  supported_fraction = float(np.mean(window_counts >= 20))
+  tail_seconds = max(0., soundtrack_seconds - last_video)
+  metrics = {
+    'similarity_percent': float(similarity),
+    'median_video_per_audio_rate': float(rate),
+    'source_video_seconds': movie_seconds,
+    'source_movie_audio_seconds': soundtrack_seconds,
+    'source_ad_seconds': ad_seconds,
+    'first_matched_video_seconds': float(support[0]) if support.size else None,
+    'last_matched_video_seconds': float(support[-1]) if support.size else None,
+    'first_replaced_video_seconds': first_video,
+    'last_replaced_video_seconds': last_video,
+    'ad_replaced_seconds': sum(end - start for _, _, start, end in spans) / sample_rate,
+    'intro_original_seconds': first_video,
+    'tail_original_seconds': tail_seconds,
+    'max_interior_original_seconds': max_interior,
+    'max_unverified_overlap_seconds': max_unsupported,
+    'max_local_discontinuity_seconds': max_discontinuity,
+    'fitted_offset_range_seconds': offset_range,
+    'supported_window_fraction': supported_fraction,
+    'source_ad_intro_trim_seconds': first_ad,
+    'source_ad_tail_trim_seconds': max(0., ad_seconds - last_ad),
+    'audio_retimed': any(ad_end-ad_start != end-start for ad_start, ad_end, start, end in spans),
+    'join_fade_seconds': PRESERVATION_JOIN_FADE_SECONDS,
+  }
+  reasons = []
+  if not spans or last_video-first_video < 10 or supported_fraction < .75 or max_unsupported > 30:
+    reasons.append('insufficient_overlap_support')
+  if not support.size or support[0]-first_video > 3 or last_video-support[-1] > 3:
+    reasons.append('unverified_overlap_boundary')
+  if np.any(np.diff(audio_times) <= 0) or np.any(np.diff(video_times) <= 0):
+    reasons.append('nonmonotonic_alignment')
+  if max_interior > .250 or max_discontinuity > .250 or offset_range > .250:
+    reasons.append('interior_gap_or_edit_jump')
+  if not .94 <= rate <= 1.06:
+    reasons.append('unsupported_rate')
+  if abs(movie_seconds-soundtrack_seconds) > .250:
+    reasons.append('original_soundtrack_duration_differs')
+  if (first_ad > 3 and first_video > .250) or (ad_seconds-last_ad > 3 and tail_seconds > .250):
+    reasons.append('unverified_ad_trim')
+  return spans, metrics, reasons
+
+
+def sync_features(pcm):
+  # Broadband and transient energy survive a lossy encode, modest EQ, and mixed narration.
+  block_size = AUDIO_SAMPLE_RATE // 100
+  mono = pcm.astype(np.float32).mean(axis=0)
+  mono = mono[:len(mono) - len(mono) % block_size]
+  if not len(mono):
+    return np.empty((0, 2))
+  difference = np.diff(mono, prepend=mono[0])
+  return np.column_stack([np.log1p(np.sqrt(np.mean(
+    wave.reshape(-1, block_size)**2, axis=1))) for wave in (mono, difference)])
+
+
+def check_rendered_window(output_path, audio_index, original_pcm, start):
+  margin = .250
+  length = original_pcm.shape[1] / AUDIO_SAMPLE_RATE
+  if start < margin or length < .5:
+    return {'video_seconds': start, 'status': 'inconclusive'}
+  reference = sync_features(original_pcm)
+  result = subprocess.run(
+    [get_ffmpeg(), '-v', 'error', '-xerror', '-ss', f'{start-margin:.3f}', '-i', str(output_path),
+     '-t', f'{length+2*margin:.3f}', '-map', f'0:a:{audio_index}', '-ac', '2',
+     '-ar', str(AUDIO_SAMPLE_RATE), '-f', 's16le', '-'],
+    capture_output=True, timeout=30, check=True)
+  observed = sync_features(np.frombuffer(result.stdout, dtype='<i2').reshape(-1, 2).T)
+  reference -= reference.mean(axis=0)
+  reference_norm = np.linalg.norm(reference, axis=0)
+  if np.max(reference_norm) < .30 or len(observed) < len(reference)+round(2*margin*100)-1:
+    return {'video_seconds': start, 'status': 'inconclusive'}
+  scores = []
+  for index in range(len(observed)-len(reference)+1):
+    window = observed[index:index+len(reference)] - observed[index:index+len(reference)].mean(axis=0)
+    norm = reference_norm*np.linalg.norm(window, axis=0)
+    scores.append(float(np.mean(np.sum(reference*window, axis=0)/np.maximum(norm, 1.e-6))))
+  peak_index = int(np.argmax(scores))
+  lag = peak_index/100 - margin
+  strongest_other = max((score for index, score in enumerate(scores) if abs(index-peak_index) > 10),
+                        default=-1.)
+  separation = scores[peak_index] - strongest_other
+  passed = abs(lag) <= .081 and scores[peak_index] >= .55 and separation >= .05
+  return {'video_seconds': start, 'status': 'passed' if passed else 'inconclusive',
+          'lag_seconds': lag, 'correlation': scores[peak_index], 'peak_separation': separation}
+
+
+def get_sync_windows(metrics, original_pcm):
+  def sample_window(start, length):
+    first_sample = round(start * AUDIO_SAMPLE_RATE)
+    end_sample = round((start + length) * AUDIO_SAMPLE_RATE)
+    return start, original_pcm[:,max(0, first_sample):max(0, end_sample)].copy()
+
+  first = metrics['first_replaced_video_seconds']
+  last = metrics['last_replaced_video_seconds']
+  # Include shared material immediately before any return to original credit audio.
+  shared = [sample_window(round(first + frac*(last-first) - 1.5, 2), 3.)
+            for frac in (.2, .5, .8)]
+  tail = None
+  if metrics['tail_original_seconds'] > .250:
+    shared.append(sample_window(round(last-3.2, 2), 3.))
+    tail = sample_window(round(last+.15, 2), min(3., round(metrics['tail_original_seconds']-.45, 2)))
+  return shared, tail
+
+
+def media_timestamp_seconds(value):
+  if value is None or value == 'N/A':
+    return None
+  try:
+    parts = str(value).split(':')
+    seconds = sum(float(part)*60**index for index, part in enumerate(reversed(parts)))
+  except (TypeError, ValueError):
+    return None
+  return seconds if np.isfinite(seconds) else None
+
+
+def verify_original_streams(source, rendered):
+  tolerance = .100
+  issues = []
+  original_streams = source['streams']
+  output_streams = rendered['streams']
+  # MP4 muxing may put its chapter data stream after the appended audio stream.
+  # Identify the addition by its audio ordinal, then compare the originals in order.
+  original_audio_count = sum(stream.get('codec_type') == 'audio' for stream in original_streams)
+  output_audio_indices = [index for index, stream in enumerate(output_streams)
+                          if stream.get('codec_type') == 'audio']
+  ad_index = output_audio_indices[original_audio_count] if len(output_audio_indices) > original_audio_count else None
+  output_originals = [stream for index, stream in enumerate(output_streams) if index != ad_index]
+  matched_streams = 0
+  timed_streams = 0
+
+  def stream_duration(stream):
+    duration = media_timestamp_seconds(stream.get('duration'))
+    return duration if duration is not None else media_timestamp_seconds(
+      stream.get('tags', {}).get('DURATION'))
+
+  def same_time(before, after):
+    return before is not None and after is not None and abs(before-after) <= tolerance
+
+  stream_properties = ('codec_type', 'codec_name', 'width', 'height', 'pix_fmt',
+                       'sample_rate', 'channels', 'channel_layout')
+  if len(output_streams) != len(original_streams)+1:
+    issues.append('stream_count_differs')
+  for index, (before, after) in enumerate(zip(original_streams, output_originals)):
+    properties_match = all(before.get(key) == after.get(key) for key in stream_properties)
+    tags_match = all((before.get('tags', {}).get(key) or default) ==
+                     (after.get('tags', {}).get(key) or default)
+                     for key, default in (('language', 'und'), ('title', '')))
+    if not properties_match or not tags_match or before.get('disposition') != after.get('disposition'):
+      issues.append(f'stream_{index}_identity_differs')
+      continue
+    start_before = media_timestamp_seconds(before.get('start_time'))
+    start_after = media_timestamp_seconds(after.get('start_time'))
+    duration_before = stream_duration(before)
+    duration_after = stream_duration(after)
+    av = before.get('codec_type') in ('video', 'audio')
+    if av or before.get('codec_type') in ('subtitle', 'data'):
+      same_start = same_time(start_before, start_after)
+      same_duration = same_time(duration_before, duration_after)
+      if not av:
+        same_start |= start_before is None and start_after is None
+        same_duration |= duration_before is None and duration_after is None
+      if not same_start or not same_duration:
+        issues.append(f'stream_{index}_timing_differs_or_unavailable')
+        continue
+    matched_streams += 1
+    timed_streams += av
+
+  original_chapters = source.get('chapters', [])
+  output_chapters = rendered.get('chapters', [])
+  matched_chapters = 0
+  if len(original_chapters) != len(output_chapters):
+    issues.append('chapter_count_differs')
+  for index, (before, after) in enumerate(zip(original_chapters, output_chapters)):
+    if (any(not same_time(media_timestamp_seconds(before.get(key)),
+                          media_timestamp_seconds(after.get(key))) for key in ('start_time', 'end_time'))
+        or before.get('tags', {}).get('title', '') != after.get('tags', {}).get('title', '')):
+      issues.append(f'chapter_{index}_differs')
+    else:
+      matched_chapters += 1
+
+  if timed_streams < 2 or not {'video', 'audio'}.issubset(
+      stream.get('codec_type') for stream in original_streams):
+    issues.append('insufficient_original_stream_timing')
+  if ad_index is None:
+    issues.append('added_ad_stream_unverified')
+  else:
+    ad_stream = output_streams[ad_index]
+    disposition = ad_stream.get('disposition', {})
+    if ad_stream.get('codec_type') != 'audio' or not (disposition.get('visual_impaired') or
+                                                     disposition.get('descriptions')):
+      issues.append('added_ad_stream_unverified')
+    source_start = media_timestamp_seconds(source['format'].get('start_time'))
+    source_duration = media_timestamp_seconds(source['format'].get('duration'))
+    if (not same_time(media_timestamp_seconds(ad_stream.get('start_time')), source_start)
+        or not same_time(stream_duration(ad_stream), source_duration)):
+      issues.append('added_ad_track_does_not_span_movie')
+
+  return {'status': 'review_required' if issues else 'passed', 'issues': issues,
+          'source_streams': len(original_streams), 'matched_original_streams': matched_streams,
+          'timed_av_streams': timed_streams, 'source_chapters': len(original_chapters),
+          'matched_chapters': matched_chapters, 'timeline_tolerance_seconds': tolerance}
+
+
+def write_validation_manifest(manifest_path, video_path, ad_path, output_path, metrics, reasons,
+                              references, source_probe):
+  # This sidecar is only authoritative for a newly rendered, explicitly scoped output.
+  audio_index = sum(stream['codec_type'] == 'audio' for stream in source_probe['streams'])
+  rendered_probe = ffmpeg.probe(output_path, cmd=get_ffprobe(), show_chapters=None)
+  preservation = verify_original_streams(source_probe, rendered_probe)
+  metrics['original_stream_preservation'] = preservation
+  if preservation['status'] != 'passed':
+    reasons.append('original_stream_preservation_unverified')
+  shared = []
+  tail = None
+  if references:
+    shared_refs, tail_ref = references
+    try:
+      shared = [check_rendered_window(output_path, audio_index, pcm, start)
+                for start, pcm in shared_refs]
+      if tail_ref:
+        start, pcm = tail_ref
+        tail = check_rendered_window(output_path, audio_index, pcm, start)
+    except (subprocess.SubprocessError, OSError, ValueError):
+      reasons.append('post_render_decode_failed')
+  passed = (len(shared) >= 3 and all(window['status'] == 'passed' for window in shared)
+            and (metrics['tail_original_seconds'] <= .250 or bool(tail and tail['status'] == 'passed')))
+  if not passed:
+    reasons.append('post_render_sync_unverified')
+  metrics['post_render_sync'] = {'status': 'passed' if passed else 'review_required',
+                                 'shared_windows': shared, 'restored_tail_window': tail}
+  output = Path(output_path).absolute()
+  manifest = {
+    'schema': 1,
+    'mode': 'stretch_audio',
+    'video_path': str(Path(video_path).absolute()),
+    'audio_path': str(Path(ad_path).absolute()),
+    'output_path': str(output),
+    'output_bytes': output.stat().st_size,
+    'verdict': 'review_required' if reasons else 'qualified',
+    'reasons': reasons,
+    'metrics': metrics,
+  }
+  destination = Path(manifest_path)
+  temporary = None
+  try:
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=destination.parent,
+                                     prefix='.validation-', delete=False) as sidecar:
+      temporary = Path(sidecar.name)
+      json.dump(manifest, sidecar, indent=2, ensure_ascii=False, allow_nan=False)
+      sidecar.write('\n')
+    if os.path.lexists(destination):
+      raise FileExistsError(f'Validation manifest already exists: {destination}')
+    os.replace(temporary, destination)
+  finally:
+    if temporary is not None:
+      temporary.unlink(missing_ok=True)
+  print(f"  validation: {manifest['verdict']} ({destination})")
+
+
 # use the smooth alignment to replace runs of video sound with corresponding described audio
-def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction):
+def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction,
+                             spans=None, join_fade_samples=0):
   # perform quadratic interpolation of the audio description's waveform
   # this allows it to be stretched to match the corresponding video segment
   def audio_desc_arr_interp(samples):
@@ -434,34 +744,41 @@ def replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_
       output[:,out_start:out_start+window_size] += input[:,in_start:in_start+window_size] * bump_head
       output[:,out_start+window_size:out_end+window_size] = input[:,in_start+window_size:in_end+window_size]
   
-  x = audio_desc_times
-  y = video_times
-  x_samples = (x * AUDIO_SAMPLE_RATE).astype(int)
-  y_samples = (y * AUDIO_SAMPLE_RATE).astype(int)
-  diff_x_samples = np.diff(x_samples)
-  diff_y_samples = np.diff(y_samples)
-  slopes = diff_x_samples / diff_y_samples
-  total_offset_samples = diff_y_samples - diff_x_samples
-  y_midpoint_samples = (y_samples[:-1] + y_samples[1:]) // 2
+  if spans is None:
+    spans = get_replacement_spans(audio_desc_times, video_times)
   progress_update_interval = (video_arr.shape[1] // 100) + 1
   last_progress_update = -1
-  for i in range(len(x) - 1):
-    if diff_y_samples[i] < (MIN_DURATION_TO_REPLACE_SECONDS * AUDIO_SAMPLE_RATE) or \
-       np.abs(1 - slopes[i]) > MAX_RATE_RATIO_DIFF_ALIGN:
-      continue
-    video_arr_slice = video_arr[:,slice(*y_samples[i:i+2])]
-    progress = int(y_midpoint_samples[i] // progress_update_interval)
+  for index, (ad_start, ad_end, video_start, video_end) in enumerate(spans):
+    video_length = video_end - video_start
+    ad_length = ad_end - ad_start
+    slope = ad_length / video_length
+    video_arr_slice = video_arr[:,video_start:video_end]
+    previous_end = spans[index-1][3] if index else 0
+    next_start = spans[index+1][2] if index+1 < len(spans) else video_arr.shape[1]
+    fade_in = join_fade_samples if video_start > previous_end else 0
+    fade_out = join_fade_samples if video_end < next_start else 0
+    original_intro = video_arr_slice[:,:fade_in].copy() if fade_in else None
+    original_tail = video_arr_slice[:,-fade_out:].copy() if fade_out else None
+    progress = int(((video_start + video_end) // 2) // progress_update_interval)
     if progress > last_progress_update:
       last_progress_update = progress
       print(f"  stretching audio:{progress:3d}%                        \r", end='')
     # only apply pitch correction if the difference would be noticeable
-    if no_pitch_correction or np.abs(1 - slopes[i]) <= JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO or \
-       abs(total_offset_samples[i]) < MIN_STRETCH_OFFSET:
+    if ad_length == video_length:
+      video_arr_slice[:] = audio_desc_arr[:,ad_start:ad_end]
+    elif no_pitch_correction or abs(1 - slope) <= JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO or \
+         abs(video_length - ad_length) < MIN_STRETCH_OFFSET:
       # construct a stretched audio description waveform using the quadratic interpolator
-      sample_points = np.linspace(*x_samples[i:i+2], num=diff_y_samples[i], endpoint=False)
+      sample_points = np.linspace(ad_start, ad_end, num=video_length, endpoint=False)
       video_arr_slice[:] = audio_desc_arr_interp(sample_points)
     else:
-      stretch(audio_desc_arr[:,slice(*x_samples[i:i+2])], video_arr_slice)
+      stretch(audio_desc_arr[:,ad_start:ad_end], video_arr_slice)
+    if fade_in:
+      blend = np.linspace(0, 1, fade_in, dtype=np.float32)
+      video_arr_slice[:,:fade_in] = blend * video_arr_slice[:,:fade_in] + (1-blend) * original_intro
+    if fade_out:
+      blend = np.linspace(1, 0, fade_out, dtype=np.float32)
+      video_arr_slice[:,-fade_out:] = blend * video_arr_slice[:,-fade_out:] + (1-blend) * original_tail
 
 # Convert piece-wise linear fit to ffmpeg expression for editing video frame timestamps
 def encode_fit_as_ffmpeg_expr(audio_desc_times, video_times, video_offset):
@@ -530,7 +847,8 @@ def is_first_video_track_ad(video_file):
 # outputs a new media file with the replaced audio (which includes audio descriptions)
 def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, audio_desc_file=None,
                                  setts_cmd=None, video_offset=None, after_start_key_frame=None,
-                                 median_slope=1., retimestamp_original_audio=False):
+                                 median_slope=1., retimestamp_original_audio=False,
+                                 preserve_original_dispositions=False):
   # if a media array is given, stretch_audio is enabled and media_arr should be added to the video
   if media_arr is not None:
     media_input = ffmpeg.input('pipe:', format='s16le', acodec='pcm_s16le', ac=2, ar=AUDIO_SAMPLE_RATE)
@@ -550,7 +868,7 @@ def write_replaced_media_to_disk(output_filename, media_arr, video_file=None, au
                 f"disposition:a:{original_audio_count}": ad_disposition,
                 f"metadata:s:a:{original_audio_count}": "title=Audio Description",
                 "map_metadata": 0, "map_chapters": 0}
-      if original_audio_count > 0:
+      if original_audio_count > 0 and not preserve_original_dispositions:
         kwargs["disposition:a:0"] = "default"
       # "-max_interleave_delta 0" is sometimes necessary to fix an .mkv bug that freezes audio/video:
       #   ffmpeg bug warning: [matroska @ 0000000002c814c0] Starting new cluster due to timestamp
@@ -1210,7 +1528,7 @@ def align(video_features, audio_desc_features, video_energy, audio_desc_energy):
 # combines videos with matching audio files (e.g. audio descriptions)
 # this is the main function of this script, it calls the other functions in order
 def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitch_correction=False,
-            output_dir=default_output_dir, alignment_dir=default_alignment_dir):
+            output_dir=default_output_dir, alignment_dir=default_alignment_dir, validation_manifest=None):
   video_files, has_audio_extensions = get_sorted_filenames(video, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS)
 
   if yes == False and sum(has_audio_extensions) > 0:
@@ -1231,6 +1549,15 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
                  f"The video path has {len(video_files)} files",
                  f"The audio path has {len(audio_desc_files)} files"]
     raise RuntimeError("\n".join(error_msg))
+
+  if validation_manifest is not None:
+    if not stretch_audio or len(video_files) != 1 or has_audio_extensions[0]:
+      raise RuntimeError('--validation_manifest requires one video and one audio file in --stretch_audio mode.')
+    validation_manifest = Path(validation_manifest).absolute()
+    planned_output = Path(output_dir, prepend + Path(video_files[0]).name).absolute()
+    if validation_manifest == planned_output or os.path.lexists(validation_manifest):
+      raise FileExistsError(f'Validation manifest must be a new sidecar path: {validation_manifest}')
+    validation_manifest.parent.mkdir(parents=True, exist_ok=True)
 
   print("")
   ensure_folders_exist([output_dir])
@@ -1277,6 +1604,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
       if (not stretch_audio) and has_audio_extension:
         raise RuntimeError("Argument --stretch_audio is required when both inputs are audio files.")
 
+      if validation_manifest is not None and os.path.lexists(output_filename):
+        raise FileExistsError(f'Validation requires a fresh output: {output_filename}')
       if os.path.exists(output_filename) and os.path.getsize(output_filename) > 1e5:
         print("   output file already exists, skipping...")
         continue
@@ -1326,6 +1655,17 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         median_slope = 1.
 
       if stretch_audio:
+        spans = None
+        if validation_manifest is not None:
+          source_probe = ffmpeg.probe(video_file, cmd=get_ffprobe(), show_chapters=None)
+          movie_duration = source_probe['format']['duration']
+          spans, metrics, reasons = plan_preserved_audio(
+            audio_desc_times, video_times, path, similarity_percent, median_slope,
+            video_arr.shape[1], audio_desc_arr.shape[1], float(movie_duration))
+          if no_pitch_correction and abs(1-median_slope) > JUST_NOTICEABLE_DIFF_IN_FREQ_RATIO:
+            reasons.append('pitch_correction_disabled')
+          references = get_sync_windows(metrics, video_arr) if spans else None
+
         # lower memory usage version of np.std for large arrays
         def low_ram_std(arr):
           avg = np.mean(arr, dtype=np.float64)
@@ -1340,7 +1680,9 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
           else:
             audio_desc_arr[channel_index] *= channel_scale_factor
 
-        replace_aligned_segments(video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction)
+        replace_aligned_segments(
+          video_arr, audio_desc_arr, audio_desc_times, video_times, no_pitch_correction, spans=spans,
+          join_fade_samples=round(PRESERVATION_JOIN_FADE_SECONDS*AUDIO_SAMPLE_RATE) if validation_manifest else 0)
         del audio_desc_arr
 
         # prevent peaking by rescaling to within +/- 32,766
@@ -1349,7 +1691,8 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         print("  processing output file...                   \r", end='')
         ffmpeg_command = write_replaced_media_to_disk(output_filename, video_arr,
                                                       None if has_audio_extension else video_file,
-                                                      median_slope=median_slope)
+                                                      median_slope=median_slope,
+                                                      preserve_original_dispositions=validation_manifest is not None)
         del video_arr
       else:
         video_offset = video_times[0] - audio_desc_times[0]
@@ -1373,6 +1716,9 @@ def combine(video, audio, stretch_audio=False, yes=False, prepend="ad_", no_pitc
         plot_filename_no_ext = os.path.join(alignment_dir, os.path.splitext(os.path.split(video_file)[1])[0])
         plot_alignment(plot_filename_no_ext, path, audio_desc_times, video_times, similarity_percent,
                        median_slope, stretch_audio, no_pitch_correction, ffmpeg_command)
+      if validation_manifest is not None:
+        write_validation_manifest(validation_manifest, video_file, audio_desc_file, output_filename,
+                                  metrics, reasons, references, source_probe)
 
     except Exception as e:
       failures.append((video_file, audio_desc_file, str(e)))
@@ -1994,6 +2340,14 @@ def get_version_hash(filename):
 # Entry point for command line interaction, for example:
 # > describealign video.mp4 audio_desc.mp3
 def command_line_interface():
+  # Redirected Windows streams can default to CP1252 and fail on media metadata.
+  for stream in (sys.stdout, sys.stderr):
+    if isinstance(stream, io.TextIOWrapper):
+      if stream.isatty():
+        stream.reconfigure(errors='backslashreplace')
+      else:
+        stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+
   if len(sys.argv) < 2:
     if wx is not None:
       # No args, run gui
@@ -2033,6 +2387,8 @@ def command_line_interface():
                       help='Directory combined output media is saved to. Default is "videos_with_ad"')
   parser.add_argument("--alignment_dir", default=default_alignment_dir,
                       help='Directory alignment data and plots are saved to. Default is "alignment_plots"')
+  parser.add_argument('--validation_manifest', metavar='PATH',
+                      help='Write measured preservation evidence for one new --stretch_audio output.')
   parser.add_argument("--install-ffmpeg", action="store_true",
                       help="Install the required ffmpeg binaries and then exit. This is meant to be " + \
                            "run from a privileged installer process (e.g. OS X Installer)")
@@ -2067,7 +2423,8 @@ def command_line_interface():
     os.chmod(get_ffprobe(), 0o755)
   elif args.video and args.audio:
     return combine(args.video, args.audio, args.stretch_audio, args.yes, args.prepend,
-                   args.no_pitch_correction, args.output_dir, args.alignment_dir)
+                   args.no_pitch_correction, args.output_dir, args.alignment_dir,
+                   args.validation_manifest)
   else:
     parser.print_usage()
 

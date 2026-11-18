@@ -174,6 +174,23 @@ Instead of changing the video timing to fit the external audio, it stretches the
 
 It is also required when aligning audio to another audio file.
 
+For automated delivery, pass `--validation_manifest <new-json-path>` with
+`--stretch_audio` for one video and one AD input. This mode copies the movie
+streams and makes a new stereo AD track. It uses soundtrack from the movie
+outside the aligned overlap and fades briefly into the original audio at the
+credits. A consistent offset is handled with a trim or delay.
+
+The UTF-8 JSON sidecar identifies the inputs and freshly rendered output, records
+the measured replacement and restoration spans, and reports sync measurements
+from decoded AD samples and original stream and chapter preservation checks.
+Require `schema: 1`, `verdict: "qualified"`, and passing
+`metrics.post_render_sync` and `metrics.original_stream_preservation` before
+unattended delivery.
+`review_required` identifies uncertain coverage, discontinuities, or inconclusive
+measurements. The file is written after the render even when it requires review,
+so callers must check the verdict independently of the exit status. Narration
+completeness and sound quality require a listening review.
+
 ### Drag and Drop
 
 You can drag files or folders directly into the GUI input lists. Unsupported extensions are ignored.
